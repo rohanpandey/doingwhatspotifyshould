@@ -124,42 +124,51 @@ Results show a match % score and can optionally be saved to a new playlist.
 
 ### Task 6 · Taste engine
 
-A persistent, self-improving discovery system. The core idea: every track in your library is indexed as "known" and will never be recommended. Every track shown in any session is added to a "seen" set and won't appear again. The system gets more novel over time, not less.
+A persistent, self-improving discovery system. The core idea: every track in your library is indexed as "known" and will never be recommended. Tracks surfaced in past sessions expire from the "seen" set after 90 days, so the pool stays novel without permanently shrinking. The system gets more interesting over time, not less.
 
 **Discovery modes:**
 
 | Mode | What it does |
 |------|-------------|
 | Centroid | Finds tracks closest to your taste cluster centroids — safe, high match rate |
-| Boundary | Pushes 1–2 standard deviations outside your clusters — adjacent, genuinely new |
-| Frontier | Pushes 2–3 standard deviations out — real adventure, lower hit rate |
-| Artist graph | 2-hop traversal: your top artists → related → their related; scores top tracks by audio similarity |
+| Boundary | Pushes 1–2 standard deviations outside your clusters — adjacent, genuinely new; exploration direction is randomised per session |
+| Frontier | Pushes 2–3 standard deviations out — real adventure, lower hit rate; direction randomised per session |
+| Artist graph | 2-hop traversal: your top artists → related → their related; scores top tracks by weighted audio similarity + novelty bonus for low-popularity tracks |
+| Artist pool | Same artist graph traversal but re-ranks candidates by weighted similarity locally, bypassing the Spotify recommendations API entirely — surfaces more obscure tracks |
 
 **Rating system** (during a session):
 
 | Key | Meaning |
 |-----|---------|
-| `l` | Loved — counts double in learning |
+| `l` | Loved — counts double in learning; audio features stored for KNN scoring |
 | `k` | Liked |
 | `s` | Skip (default) |
-| `d` | Disliked — permanently excluded from future sessions |
+| `d` | Disliked — excluded from all future sessions |
 | `q` | Quit session |
+
+Each track in the results table shows two scores: **Sim %** (weighted audio similarity to your taste cluster target) and **KNN %** (average similarity to the audio features of tracks you've previously loved).
 
 **What the engine learns from your ratings:**
 
 1. **Session log** (`session_log.jsonl`) — every shown track is logged with its audio features, rating, and which algorithm surfaced it. Append-only. Never deleted.
 
-2. **Algorithm bandit (UCB1)** — tracks love+like rate per discovery mode. Balances exploiting the best-performing algorithm with exploring under-tried ones. View the leaderboard with action 4 in the task menu.
+2. **Algorithm bandit (Thompson Sampling)** — tracks the love+like rate per discovery mode using a Beta distribution. Balances exploiting the best-performing algorithm with exploring under-tried ones probabilistically. View the leaderboard with action 4 in the task menu.
 
-3. **Cluster drift (EMA)** — after each session, cluster centroids shift 10% toward the mean audio features of tracks you loved. Your taste model slowly becomes a reflection of what you actually respond to, not just your historical saves.
+3. **Cluster drift (EMA)** — after each session, cluster centroids shift 10% toward the mean audio features of tracks you loved. Your taste model slowly becomes a reflection of what you actually respond to, not just your historical saves. Clusters are modelled with a Gaussian Mixture Model (full covariance) for better fit on non-spherical taste distributions.
 
-4. **Feature weight learning** — once you have ~20+ rated tracks, a logistic regression is fitted on (audio features → loved/liked vs skipped/disliked). The resulting feature importance scores replace the uniform weights in the similarity metric. If high valence turns out to be strongly predictive for you, the match scores and target feature selection will reflect that.
+4. **Feature weight learning** — once you have ~20+ rated tracks, a gradient-boosted classifier is fitted on (audio features → loved/liked vs skipped/disliked), with recent ratings weighted more heavily via exponential temporal decay. The resulting feature importance scores replace the uniform weights in the similarity metric. If high valence turns out to be strongly predictive for you, the match scores and target feature selection will reflect that.
+
+5. **Loved-vector memory** — the audio features of every track you love are stored in a rolling window (up to 200 vectors). Each session, new candidates are scored against this window (KNN %) in addition to the cluster-target similarity score, giving you a second signal that's grounded in your actual moment-to-moment reactions rather than the aggregate cluster.
+
+**Seen-track expiry:**
+
+Tracks are marked "seen" with a timestamp rather than permanently excluded. After 90 days a track becomes eligible again — useful for artists with a large back-catalogue that you want to rediscover. Disliked tracks are excluded permanently regardless.
 
 **Persistent files:**
 
 | File | Purpose |
 |------|---------|
-| `taste_model.json` | Cluster centroids, bandit state, feature weights, exclusion sets |
+| `taste_model.json` | Cluster centroids, bandit state, feature weights, loved vectors, exclusion sets |
 | `session_log.jsonl` | Full append-only history of every shown/rated track |
 | `.spotify_token_cache` | OAuth token (auto-refreshed) |
 
@@ -204,9 +213,9 @@ spotify-manager/
 
 **On "never played" accuracy** — Spotify does not expose full play history via the API. The heuristic (not in last 50 plays + added > N days ago) is intentionally conservative. Use the JSON report as a starting point for manual review.
 
-**On Spotify's recommendations API** — the API used in tasks 5 and 6 (centroid/boundary/frontier modes) only surfaces tracks with meaningful play counts, so truly obscure music is less likely to appear. The artist graph mode partially sidesteps this by fetching directly from artist catalogs rather than going through the recommendations endpoint.
+**On Spotify's recommendations API** — the centroid/boundary/frontier modes in task 6 call Spotify's recommendations endpoint, which surfaces tracks with meaningful play counts; truly obscure music is less likely to appear here. The artist-graph and artist-pool modes bypass this by fetching directly from artist catalogues and re-ranking locally — they will surface more niche tracks. A popularity cap (`max_popularity = 75`) is applied across all recommendation calls to bias results toward less mainstream picks.
 
-**On feature weights** — the logistic regression needs both positive (loved/liked) and negative (skipped/disliked) examples to learn anything meaningful. If you skip everything, the weights won't update. Rate honestly for best results.
+**On feature weights** — the gradient-boosted classifier needs both positive (loved/liked) and negative (skipped/disliked) examples to learn anything meaningful. If you skip everything, the weights won't update. Rate honestly for best results. Temporal decay means recent ratings influence the model more than older ones, so your tastes can shift over time without manual resets.
 
 **On the `.env` file** — never commit it. The `.env.example` template is safe to commit; `.env` is gitignored.
 
