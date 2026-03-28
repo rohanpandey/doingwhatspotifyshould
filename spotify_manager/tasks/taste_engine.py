@@ -1,5 +1,18 @@
 """
 taste_engine.py — Task 6: self-improving music discovery with persistent taste model.
+
+Discovery pipeline
+------------------
+1. bandit_pick()     → Thompson Sampling suggests the best mode; user can override
+2. session_seed      → single int used throughout the session so all random choices
+                       (boundary/frontier direction, etc.) are reproducible if needed
+3. Candidate source  → Spotify recommendations API  OR  artist-catalog pool
+                       (user chooses; artist pool sidesteps mainstream bias)
+4. Exclusion filter  → known / disliked (permanent) + seen within SEEN_EXPIRY_DAYS
+5. Scoring           → _weighted_similarity with learned feature weights
+                       + score_by_loved_knn from TasteModel's rolling vector memory
+6. Model update      → EMA cluster drift, loved-vector update,
+                       GradientBoosting re-fit with temporal decay, bandit update
 """
 
 import datetime
@@ -9,16 +22,17 @@ import spotipy
 
 from ..utils.display import HAS_RICH, console, confirm, ask
 from ..utils.spotify import paginate, get_all_playlists, get_playlist_tracks
-from ..utils.audio import _batch_audio_features, _similarity_score
+from ..utils.audio import _batch_audio_features, _similarity_score, _weighted_similarity
 from ..models.taste_model import (
-    TasteModel, log_session, load_session_log, FEATURE_KEYS_FULL,
+    TasteModel, log_session, load_session_log,
+    FEATURE_KEYS_FULL, MAX_LOVED_VECTORS,
 )
 
 
 # ── Analytics ─────────────────────────────────────────────────────────────────
 
 def _print_algo_analytics(model: TasteModel):
-    """Print per-algorithm performance from bandit state + full session log summary."""
+    """Print per-algorithm performance (Thompson Sampling state) + session stats."""
     console.rule("[bold]Algorithm performance[/bold]")
 
     rows = model.bandit_summary()
@@ -49,6 +63,9 @@ def _print_algo_analytics(model: TasteModel):
             bar    = "█" * filled + "░" * (bar_w - filled)
             console.print(f"  {k:<20} {bar}  {v:.2f}")
 
+    console.print(f"\n[bold]KNN memory:[/bold] {len(model.loved_vectors)} loved vectors stored "
+                  f"(max {MAX_LOVED_VECTORS})")
+
     sessions = load_session_log()
     if sessions:
         total_tracks = sum(len(s.get("tracks", [])) for s in sessions)
@@ -67,10 +84,12 @@ def _print_algo_analytics(model: TasteModel):
 def _print_model_summary(model: TasteModel):
     console.print(f"\n[bold]Taste Model[/bold]  [dim](built {model.built_at or 'never'})[/dim]")
     console.print(f"  Known (excluded):     {len(model.known_ids):,}")
-    console.print(f"  Seen in sessions:     {len(model.seen_ids):,}")
+    console.print(f"  Seen in window:       {len(model.seen_ids):,}  "
+                  f"[dim](expire after {model.SEEN_EXPIRY_DAYS if hasattr(model, 'SEEN_EXPIRY_DAYS') else 90}d)[/dim]")
     console.print(f"  Disliked (excluded):  {len(model.disliked_ids):,}")
     console.print(f"  Saved from sessions:  {len(model.saved_ids):,}")
     console.print(f"  Sessions run:         {model.session_count}")
+    console.print(f"  Loved vectors stored: {len(model.loved_vectors)}")
     console.print(f"\n  [bold]Clusters:[/bold]")
     for i, cl in enumerate(model.clusters):
         c, s = cl["center"], cl["spread"]
@@ -83,7 +102,7 @@ def _print_model_summary(model: TasteModel):
 
 
 def _build_taste_model(sp: spotipy.Spotify, model: TasteModel):
-    """Scan the full library, index known tracks, and fit taste clusters."""
+    """Scan the full library, index known tracks, and fit GMM taste clusters."""
     console.print("\n[bold]Step 1 · Indexing your library (liked songs + all playlists)…[/bold]")
 
     liked_raw   = paginate(sp.current_user_saved_tracks)
@@ -91,8 +110,8 @@ def _build_taste_model(sp: spotipy.Spotify, model: TasteModel):
         it for it in liked_raw
         if it and it.get("track") and it["track"].get("id") and not it["track"].get("is_local")
     ]
-    liked_ids          = [it["track"]["id"] for it in liked_items]
-    model.known_ids    = set(liked_ids)
+    liked_ids       = [it["track"]["id"] for it in liked_items]
+    model.known_ids = set(liked_ids)
 
     playlists = get_all_playlists(sp)
     for pl in playlists:
@@ -107,10 +126,10 @@ def _build_taste_model(sp: spotipy.Spotify, model: TasteModel):
 
     n_clusters = int(ask("How many taste clusters to model? (3–5 recommended)", default="4"))
     model.build_clusters(features, liked_ids, n_clusters=n_clusters)
-    console.print(f"  Fitted {len(model.clusters)} clusters")
+    console.print(f"  Fitted {len(model.clusters)} clusters (GMM, full covariance)")
 
     try:
-        top                 = sp.current_user_top_artists(limit=15, time_range="medium_term")
+        top                  = sp.current_user_top_artists(limit=15, time_range="medium_term")
         model.top_artist_ids = [a["id"] for a in top.get("items", [])]
     except Exception:
         model.top_artist_ids = []
@@ -121,16 +140,30 @@ def _build_taste_model(sp: spotipy.Spotify, model: TasteModel):
 
 # ── Discovery helpers ──────────────────────────────────────────────────────────
 
-def _discover_audio(sp: spotipy.Spotify, model: TasteModel, mode: str, cluster_idx: int, n: int = 100) -> list:
-    """Call Spotify recommendations API with audio targets from the taste model."""
+def _discover_audio(sp: spotipy.Spotify, model: TasteModel, mode: str,
+                    cluster_idx: int, n: int = 100,
+                    session_seed: int | None = None) -> list:
+    """
+    Call Spotify recommendations API with audio targets from the taste model.
+
+    Improvements vs original:
+    - Tolerances are scaled by learned feature weights (tighter on important
+      features, looser on less-predictive ones)
+    - max_popularity=75 cap to reduce mainstream bias
+    - session_seed is forwarded to get_targets so boundary/frontier directions
+      are random-per-session, not hash-fixed
+    """
     cluster = model.clusters[cluster_idx % len(model.clusters)]
-    targets = model.get_targets(mode, cluster_idx)
+    targets = model.get_targets(mode, cluster_idx, session_seed=session_seed)
     seeds   = cluster.get("seed_track_ids", [])[:2]
     spread  = cluster["spread"]
 
     tol_mult = {"centroid": 0.8, "boundary": 1.5, "frontier": 2.5}.get(mode, 1.0)
 
     kwargs: dict = {"seed_tracks": seeds or None, "limit": min(n, 100)}
+
+    # Popularity cap — avoids top-40 mainstream results
+    kwargs["max_popularity"] = 75
 
     BASE_TOL = {"energy": 0.12, "valence": 0.12, "danceability": 0.12,
                 "tempo": 18.0, "acousticness": 0.18, "instrumentalness": 0.18}
@@ -139,7 +172,12 @@ def _discover_audio(sp: spotipy.Spotify, model: TasteModel, mode: str, cluster_i
         val = targets.get(k)
         if val is None:
             continue
-        tol = spread.get(k, BASE_TOL.get(k, 0.15)) * tol_mult
+        # Feature-weight-adjusted tolerance:
+        # higher weight → feature is more predictive → tighter window
+        base_tol = spread.get(k, BASE_TOL.get(k, 0.15))
+        weight   = model.feature_weights.get(k, 1.0)
+        tol      = (base_tol / max(weight, 0.25)) * tol_mult   # clamp weight floor
+
         kwargs[f"target_{k}"] = val
         if k == "tempo":
             kwargs[f"min_{k}"] = max(40.0, val - tol)
@@ -166,7 +204,10 @@ def _discover_audio(sp: spotipy.Spotify, model: TasteModel, mode: str, cluster_i
 def _discover_artist_graph(sp: spotipy.Spotify, model: TasteModel) -> list:
     """
     2-hop artist graph: top artists → related → their related.
-    Returns candidate tracks scored by audio similarity to taste cluster centroids.
+
+    Scoring uses _weighted_similarity (learned feature weights) and adds a
+    novelty bonus of up to 15 points for low-popularity tracks, pushing
+    obscure finds ahead of mainstream ones with identical audio similarity.
     """
     if not model.top_artist_ids:
         console.print("[yellow]No top artists in model. Rebuild model first.[/yellow]")
@@ -214,15 +255,59 @@ def _discover_artist_graph(sp: spotipy.Spotify, model: TasteModel) -> list:
     ids        = [t["id"] for t in candidate_tracks]
     feats_list = _batch_audio_features(sp, ids)
     feats_map  = {f["id"]: f for f in feats_list if f}
+    centroids  = [cl["center"] for cl in model.clusters]
 
-    centroids = [cl["center"] for cl in model.clusters]
+    def score(track) -> float:
+        tid        = track["id"]
+        f          = feats_map.get(tid, {})
+        if not f:
+            return 0.0
+        audio_sim  = max(_weighted_similarity(c, f, model.feature_weights) for c in centroids)
+        popularity = track.get("popularity", 50) / 100.0
+        # Novelty bonus: up to +15 for very obscure tracks (popularity ≈ 0)
+        novelty    = (1.0 - popularity) * 15.0
+        return audio_sim + novelty
 
-    def best_score(track_id: str) -> float:
-        f = feats_map.get(track_id, {})
-        return max(_similarity_score(c, f) for c in centroids) if f else 0.0
-
-    candidate_tracks.sort(key=lambda t: -best_score(t["id"]))
+    candidate_tracks.sort(key=score, reverse=True)
     return candidate_tracks
+
+
+def _discover_audio_via_artist_pool(sp: spotipy.Spotify, model: TasteModel,
+                                     mode: str, cluster_idx: int,
+                                     n: int, session_seed: int | None) -> list:
+    """
+    Bypass the Spotify recommendations API entirely.
+
+    1. Generates a candidate pool via the 2-hop artist graph (same as artist_graph
+       mode but used as the source for any mode).
+    2. Scores each candidate against the mode's target position in taste space
+       using weighted similarity + a novelty bonus.
+
+    This sidesteps Spotify's recommendations API mainstream bias at the cost of
+    a few extra API calls for artist traversal.
+    """
+    console.print("  [dim]Artist-pool mode: fetching candidates from artist catalog…[/dim]")
+    candidates_raw = _discover_artist_graph(sp, model)
+    if not candidates_raw:
+        console.print("[yellow]Artist pool empty — falling back to Spotify API.[/yellow]")
+        return _discover_audio(sp, model, mode, cluster_idx, n, session_seed)
+
+    targets  = model.get_targets(mode, cluster_idx, session_seed=session_seed)
+    ids      = [t["id"] for t in candidates_raw]
+    feats_map = {f["id"]: f for f in _batch_audio_features(sp, ids) if f}
+
+    scored = []
+    for t in candidates_raw:
+        f = feats_map.get(t["id"])
+        if not f:
+            continue
+        audio_sim  = _weighted_similarity(targets, f, model.feature_weights)
+        popularity = t.get("popularity", 50) / 100.0
+        novelty    = (1.0 - popularity) * 15.0
+        scored.append((t, audio_sim + novelty))
+
+    scored.sort(key=lambda x: -x[1])
+    return [t for t, _ in scored[:n]]
 
 
 def _feedback_session(candidates: list, model: TasteModel) -> tuple[set, set, set, set]:
@@ -232,8 +317,8 @@ def _feedback_session(candidates: list, model: TasteModel) -> tuple[set, set, se
     Returns (loved, liked, skipped, disliked) sets of track IDs.
     """
     loved, liked, skipped, disliked = set(), set(), set(), set()
-
-    console.print(f"\n[bold]Rate these tracks[/bold] [dim](l=loved · k=like · s=skip · d=dislike · q=quit)[/dim]\n")
+    console.print(f"\n[bold]Rate these tracks[/bold] "
+                  f"[dim](l=loved · k=like · s=skip · d=dislike · q=quit)[/dim]\n")
 
     for i, track in enumerate(candidates, 1):
         name   = track.get("name", "?")
@@ -280,7 +365,8 @@ def task_taste_engine(sp: spotipy.Spotify, dry_run: bool):
         console.print("  [cyan]4[/cyan] · View algorithm performance & learned feature weights")
         action = ask("Choose", default="2" if built else "1")
     else:
-        action = ask("Action (1=build, 2=discover, 3=summary, 4=analytics)", default="2" if built else "1")
+        action = ask("Action (1=build, 2=discover, 3=summary, 4=analytics)",
+                     default="2" if built else "1")
 
     if action == "1":
         _build_taste_model(sp, model)
@@ -304,14 +390,24 @@ def task_taste_engine(sp: spotipy.Spotify, dry_run: bool):
         _build_taste_model(sp, model)
         model.save()
 
+    # Single seed for this session — keeps boundary/frontier direction consistent
+    # across the session while being different every time you run
+    session_seed = int(time.time())
+
+    # Thompson Sampling suggests the best mode based on past performance
+    suggested     = model.bandit_pick()
+    mode_map      = {"1": "centroid", "2": "boundary", "3": "frontier", "4": "artist_graph"}
+    mode_map_inv  = {v: k for k, v in mode_map.items()}
+    suggested_num = mode_map_inv.get(suggested, "2")
+
     console.print("\n[bold]Discovery strategy:[/bold]")
     console.print("  [cyan]1[/cyan] · Centroid     — very similar to what you love (safe, ~85% match)")
-    console.print("  [cyan]2[/cyan] · Boundary     — adjacent to your taste, genuinely unfamiliar (stretch)")
+    console.print("  [cyan]2[/cyan] · Boundary     — adjacent to your taste, genuinely unfamiliar")
     console.print("  [cyan]3[/cyan] · Frontier     — outside your clusters, direction unknown (adventure)")
-    console.print("  [cyan]4[/cyan] · Artist graph — 2-hop related artists you've never explored")
-    strategy  = ask("Choose", default="2")
-    mode_map  = {"1": "centroid", "2": "boundary", "3": "frontier", "4": "artist_graph"}
-    mode      = mode_map.get(strategy, "boundary")
+    console.print("  [cyan]4[/cyan] · Artist graph — 2-hop related artists, novelty-boosted scoring")
+    console.print(f"  [dim]Thompson Sampling suggests: {suggested}[/dim]")
+    strategy = ask("Choose", default=suggested_num)
+    mode     = mode_map.get(strategy, suggested)
 
     cluster_idx = 0
     if mode != "artist_graph" and len(model.clusters) > 1:
@@ -328,19 +424,39 @@ def task_taste_engine(sp: spotipy.Spotify, dry_run: bool):
 
     n_results = int(ask("How many tracks to fetch?", default="20"))
 
+    # ── Candidate source ───────────────────────────────────────────────────────
+    use_artist_pool = False
+    if mode != "artist_graph" and model.top_artist_ids:
+        console.print(
+            "\n[dim]Artist-pool mode fetches candidates directly from artist catalogs\n"
+            "instead of Spotify's recommendations API — finds more obscure tracks.[/dim]"
+        )
+        pool_ans        = ask("Use artist catalog as candidate pool? (y/n)", default="n")
+        use_artist_pool = pool_ans.lower().startswith("y")
+
+    # ── Fetch candidates ───────────────────────────────────────────────────────
     console.print(f"\nRunning [bold]{mode}[/bold] discovery…")
     if mode == "artist_graph":
         candidates_raw = _discover_artist_graph(sp, model)
+    elif use_artist_pool:
+        candidates_raw = _discover_audio_via_artist_pool(
+            sp, model, mode, cluster_idx, n=max(n_results * 4, 100),
+            session_seed=session_seed,
+        )
     else:
-        candidates_raw = _discover_audio(sp, model, mode, cluster_idx, n=max(n_results * 4, 100))
+        candidates_raw = _discover_audio(
+            sp, model, mode, cluster_idx, n=max(n_results * 4, 100),
+            session_seed=session_seed,
+        )
 
-    seen_in_response: set = set()
+    # ── Exclusion filter ───────────────────────────────────────────────────────
+    seen_this_response: set = set()
     candidates = []
     for t in candidates_raw:
         tid = t.get("id")
-        if tid and not model.is_excluded(tid) and tid not in seen_in_response:
+        if tid and not model.is_excluded(tid) and tid not in seen_this_response:
             candidates.append(t)
-            seen_in_response.add(tid)
+            seen_this_response.add(tid)
 
     if not candidates:
         console.print(
@@ -351,35 +467,50 @@ def task_taste_engine(sp: spotipy.Spotify, dry_run: bool):
 
     display = candidates[:n_results]
 
+    # ── Scoring ────────────────────────────────────────────────────────────────
     rec_feats = {f["id"]: f for f in _batch_audio_features(sp, [t["id"] for t in display]) if f}
     target    = model.clusters[cluster_idx]["center"] if model.clusters else {}
 
-    console.print(f"\n[bold]{len(display)} new tracks[/bold] (excluded {len(candidates_raw) - len(candidates)} already known/seen):\n")
+    console.print(
+        f"\n[bold]{len(display)} new tracks[/bold] "
+        f"(excluded {len(candidates_raw) - len(candidates)} already known/seen):\n"
+    )
     if HAS_RICH:
         from rich.table import Table
         table = Table(show_lines=True)
-        table.add_column("#",       width=3,  justify="right")
-        table.add_column("Track",   style="white")
-        table.add_column("Artist",  style="dim")
-        table.add_column("Energy",  justify="right", width=7)
-        table.add_column("Valence", justify="right", width=7)
-        table.add_column("BPM",     justify="right", width=5)
-        table.add_column("Match",   justify="right", style="green", width=7)
+        table.add_column("#",        width=3,  justify="right")
+        table.add_column("Track",    style="white")
+        table.add_column("Artist",   style="dim")
+        table.add_column("Energy",   justify="right", width=7)
+        table.add_column("Valence",  justify="right", width=7)
+        table.add_column("BPM",      justify="right", width=5)
+        table.add_column("Sim %",    justify="right", style="cyan",  width=7)
+        table.add_column("KNN %",    justify="right", style="green", width=7)
         for i, t in enumerate(display, 1):
-            f = rec_feats.get(t["id"], {})
+            f       = rec_feats.get(t["id"], {})
+            sim_pct = _weighted_similarity(target, f, model.feature_weights) if target else 0.0
+            knn_pct = model.score_by_loved_knn(f) if f else 50.0
             table.add_row(
                 str(i), t["name"][:36],
                 t["artists"][0]["name"] if t.get("artists") else "?",
                 f"{f.get('energy',0):.2f}", f"{f.get('valence',0):.2f}",
                 f"{f.get('tempo',0):.0f}",
-                f"{_similarity_score(target, f):.0f}%" if target else "—",
+                f"{sim_pct:.0f}%",
+                f"{knn_pct:.0f}%",
             )
         console.print(table)
+        console.print("[dim]Sim % = weighted audio similarity to cluster target  "
+                      "· KNN % = similarity to your loved-track memory[/dim]")
     else:
         for i, t in enumerate(display, 1):
-            f     = rec_feats.get(t["id"], {})
-            score = _similarity_score(target, f) if target else 0
-            print(f"  {i:>2}. {t['name']} — {t['artists'][0]['name'] if t.get('artists') else '?'}  ({score:.0f}% match)")
+            f       = rec_feats.get(t["id"], {})
+            sim_pct = _weighted_similarity(target, f, model.feature_weights) if target else 0.0
+            knn_pct = model.score_by_loved_knn(f) if f else 50.0
+            print(
+                f"  {i:>2}. {t['name']} — "
+                f"{t['artists'][0]['name'] if t.get('artists') else '?'}  "
+                f"(sim {sim_pct:.0f}%  knn {knn_pct:.0f}%)"
+            )
 
     # ── Feedback ──────────────────────────────────────────────────────────────
     loved, liked_set, skipped, disliked = _feedback_session(display, model)
@@ -405,37 +536,51 @@ def task_taste_engine(sp: spotipy.Spotify, dry_run: bool):
     log_session(mode, cluster_idx, rated_records)
 
     # ── Update model ───────────────────────────────────────────────────────────
-    model.seen_ids     |= {t["id"] for t in display}
+    # 1. Mark tracks as seen (with timestamp so they expire after SEEN_EXPIRY_DAYS)
+    model.mark_seen([t["id"] for t in display])
     model.disliked_ids |= disliked
     model.saved_ids    |= loved | liked_set
     model.session_count += 1
 
+    # 2. Bandit update (Thompson Sampling posterior will shift on next bandit_pick)
     model.bandit_update(mode, loved=len(loved), liked=len(liked_set), shown=len(display))
 
+    # 3. EMA cluster drift toward loved tracks
     loved_feats    = [rec_feats[tid] for tid in loved    if tid in rec_feats]
     disliked_feats = [rec_feats[tid] for tid in disliked if tid in rec_feats]
     if loved_feats:
         model.update_clusters_from_feedback(loved_feats, disliked_feats)
         console.print("[dim]Cluster centroids updated toward loved tracks.[/dim]")
 
+    # 4. Append loved vectors to rolling window
+    if loved_feats:
+        model.add_loved_vectors(loved_feats)
+        console.print(f"[dim]KNN memory updated ({len(model.loved_vectors)} vectors).[/dim]")
+
+    # 5. Re-fit feature weights (GradientBoosting + temporal decay)
     model.learn_feature_weights()
+
     model.save()
 
     console.print(
         f"\n[bold]Session summary:[/bold]  "
         f"♥♥ {len(loved)} loved · ♥ {len(liked_set)} liked · "
         f"✗ {len(disliked)} disliked · → {len(skipped)} skipped\n"
-        f"Excluded from future sessions: {len(model.seen_ids):,} total tracks"
+        f"Seen pool: {len(model.seen_ids):,} tracks  "
+        f"(re-eligible after 90 days)"
     )
 
+    # ── Save loved/liked to playlist ──────────────────────────────────────────
     to_save = loved | liked_set
     if to_save and not dry_run:
         if confirm(f"Save {len(to_save)} ♥ track(s) to a new playlist?", dry_run=False):
-            pl_name = ask("Playlist name", default=f"Taste Engine · Session {model.session_count}")
+            pl_name = ask("Playlist name",
+                          default=f"Taste Engine · Session {model.session_count}")
             me      = sp.current_user()
             pl      = sp.user_playlist_create(
                 me["id"], pl_name, public=False,
-                description=f"Discovered via Taste Engine ({mode} mode, session {model.session_count})"
+                description=f"Discovered via Taste Engine ({mode} mode, "
+                            f"session {model.session_count})"
             )
             sp.playlist_add_items(pl["id"], [f"spotify:track:{tid}" for tid in to_save])
             console.print(f"[green]✓ '{pl_name}' created with {len(to_save)} tracks.[/green]")
