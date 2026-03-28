@@ -1,0 +1,9 @@
+.env
+.spotify_token_cache
+taste_model.json
+session_log.jsonl
+never_played_report.json
+discovery_report.json
+__pycache__/
+*.pyc
+.DS_Store
