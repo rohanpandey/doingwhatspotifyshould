@@ -35,7 +35,7 @@ pip install spotipy scikit-learn numpy rich
 
 1. Go to [developer.spotify.com/dashboard](https://developer.spotify.com/dashboard)
 2. Click **Create App**
-3. Set the redirect URI to `http://localhost:8888/callback`
+3. Set the redirect URI to `http://127.0.0.1:8888/callback`
 4. Copy your **Client ID** and **Client Secret**
 
 ### 3. Configure credentials
@@ -45,7 +45,7 @@ Create a `.env` file in the project root:
 ```env
 SPOTIFY_CLIENT_ID=your_client_id_here
 SPOTIFY_CLIENT_SECRET=your_client_secret_here
-SPOTIFY_REDIRECT_URI=http://localhost:8888/callback
+SPOTIFY_REDIRECT_URI=http://127.0.0.1:8888/callback
 ```
 
 ### 4. Run
