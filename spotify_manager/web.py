@@ -24,7 +24,7 @@ from .tasks.organise import GENRE_BUCKETS, MOOD_LABELS
 from .utils.duplicates import build_duplicate_removal_payload, find_duplicate_entries
 from .utils.audio import HAS_ML, _batch_audio_features, _batch_audio_features_with_ids, _cluster_tracks, _similarity_score
 from .utils.display import console
-from .utils.spotify import get_all_playlists, get_playlist_tracks, paginate
+from .utils.spotify import get_all_playlists, get_liked_tracks, get_playlist_tracks, paginate
 
 DISCOVERY_FEATURE_KEYS = [
     "energy",
@@ -36,6 +36,7 @@ DISCOVERY_FEATURE_KEYS = [
     "speechiness",
 ]
 GENRE_OTHER = "Other / Mixed"
+LIKED_SONGS_SOURCE_ID = "__liked_songs__"
 
 APP_STYLES = """
 :root {
@@ -824,37 +825,46 @@ def require_playlist(playlists: list[dict[str, Any]], playlist_id: str) -> dict[
     return playlist
 
 
-def scan_duplicates(sp: spotipy.Spotify, playlist_id: str) -> list[dict[str, Any]]:
-    playlists = get_all_playlists(sp)
-    playlist = require_playlist(playlists, playlist_id)
+def get_duplicate_source(sp: spotipy.Spotify, source_id: str) -> tuple[str, list[dict[str, Any]], str | None]:
+    if source_id == LIKED_SONGS_SOURCE_ID:
+        return "Liked Songs", get_liked_tracks(sp), None
+
+    playlist = require_playlist(get_all_playlists(sp), source_id)
+    return playlist["name"], get_playlist_tracks(sp, playlist["id"]), playlist["id"]
+
+
+def scan_duplicates(sp: spotipy.Spotify, source_id: str) -> list[dict[str, Any]]:
+    source_name, tracks, playlist_id = get_duplicate_source(sp, source_id)
     results = []
-    tracks = get_playlist_tracks(sp, playlist["id"])
     duplicates = find_duplicate_entries(tracks)
     if duplicates:
         results.append({
-            "playlist_id": playlist["id"],
-            "playlist_name": playlist["name"],
+            "playlist_id": source_id,
+            "playlist_name": source_name,
+            "source_kind": "liked" if source_id == LIKED_SONGS_SOURCE_ID else "playlist",
             "duplicate_count": len(duplicates),
             "tracks": duplicates,
         })
     return results
 
 
-def remove_duplicates(sp: spotipy.Spotify, playlist_id: str) -> dict[str, Any]:
-    playlists = get_all_playlists(sp)
-    playlist = require_playlist(playlists, playlist_id)
-
-    tracks = get_playlist_tracks(sp, playlist_id)
+def remove_duplicates(sp: spotipy.Spotify, source_id: str) -> dict[str, Any]:
+    source_name, tracks, playlist_id = get_duplicate_source(sp, source_id)
     duplicates = find_duplicate_entries(tracks)
     if not duplicates:
-        return {"removed": 0, "message": f"'{playlist['name']}' is already clean."}
+        return {"removed": 0, "message": f"'{source_name}' is already clean."}
 
-    payload = build_duplicate_removal_payload(duplicates)
-    for start in range(0, len(payload), 100):
-        sp.playlist_remove_specific_occurrences_of_items(playlist_id, payload[start:start + 100])
+    if source_id == LIKED_SONGS_SOURCE_ID:
+        duplicate_ids = [entry["track_id"] for entry in duplicates]
+        for start in range(0, len(duplicate_ids), 50):
+            sp.current_user_saved_tracks_delete(duplicate_ids[start:start + 50])
+    else:
+        payload = build_duplicate_removal_payload(duplicates)
+        for start in range(0, len(payload), 100):
+            sp.playlist_remove_specific_occurrences_of_items(playlist_id, payload[start:start + 100])
 
     removed = len(duplicates)
-    return {"removed": removed, "message": f"Removed {removed} duplicate tracks from '{playlist['name']}'."}
+    return {"removed": removed, "message": f"Removed {removed} duplicate tracks from '{source_name}'."}
 
 
 def scan_never_played(sp: spotipy.Spotify, playlist_id: str, cutoff_days: int) -> dict[str, Any]:
@@ -1391,8 +1401,17 @@ def render_loading_attrs(message: str, detail: str) -> str:
     )
 
 
-def render_playlist_select(name: str, playlists: list[dict[str, Any]], selected_id: str, placeholder: str = "Choose a playlist") -> str:
+def render_playlist_select(
+    name: str,
+    playlists: list[dict[str, Any]],
+    selected_id: str,
+    placeholder: str = "Choose a playlist",
+    include_liked_songs: bool = False,
+) -> str:
     options = [f"<option value=''>{escape(placeholder)}</option>"]
+    if include_liked_songs:
+        selected = " selected" if selected_id == LIKED_SONGS_SOURCE_ID else ""
+        options.append(f"<option value='{LIKED_SONGS_SOURCE_ID}'{selected}>Liked Songs</option>")
     for playlist in playlists:
         is_selected = " selected" if playlist["id"] == selected_id else ""
         track_total = (playlist.get("tracks") or {}).get("total")
@@ -1429,7 +1448,7 @@ def render_duplicates_section(playlists: list[dict[str, Any]], data: dict[str, A
                       <summary>{escape(playlist['playlist_name'])}</summary>
                       <div class="summary-line">
                         <span class="tag">{playlist['duplicate_count']} duplicates</span>
-                        <form method="post" action="/duplicates" {render_loading_attrs("Removing duplicate songs from this playlist...", "Spotify has to remove the matching positions precisely, so this can take a moment on larger playlists.")}>
+                        <form method="post" action="/duplicates" {render_loading_attrs("Removing duplicate songs from this source...", "Spotify has to remove or unlike the matching entries precisely, so this can take a moment on larger libraries.")}>
                           <input type="hidden" name="op" value="remove">
                           <input type="hidden" name="playlist_id" value="{escape(playlist['playlist_id'])}">
                           <button class="primary" type="submit">Remove duplicates</button>
@@ -1447,14 +1466,14 @@ def render_duplicates_section(playlists: list[dict[str, Any]], data: dict[str, A
       <div class="panel-head">
         <div class="tag">Task 1</div>
         <h2>Duplicate cleaner</h2>
-        <p class="panel-copy">Scan one playlist for the same song appearing more than once, even when Spotify IDs differ between versions.</p>
+        <p class="panel-copy">Scan one playlist or your liked songs for the same song appearing more than once, even when Spotify IDs differ between versions.</p>
       </div>
       <div class="panel-body">
-        <form method="post" action="/duplicates" {render_loading_attrs("Scanning the selected playlist for duplicate songs...", "Comparing songs by ISRC when available, otherwise by normalized title, artist, and duration.")}>
+        <form method="post" action="/duplicates" {render_loading_attrs("Scanning the selected source for duplicate songs...", "Comparing songs by ISRC when available, otherwise by normalized title, artist, and duration.")}>
           <input type="hidden" name="op" value="scan">
           <div class="field-grid">
-            <label>Playlist
-              {render_playlist_select("playlist_id", playlists, playlist_id)}
+            <label>Playlist or source
+              {render_playlist_select("playlist_id", playlists, playlist_id, placeholder="Choose a source", include_liked_songs=True)}
             </label>
           </div>
           <div class="button-row">

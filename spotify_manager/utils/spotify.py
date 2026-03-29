@@ -45,3 +45,20 @@ def get_playlist_tracks(sp: spotipy.Spotify, playlist_id: str):
             "track": track,
         })
     return normalized
+
+
+def get_liked_tracks(sp: spotipy.Spotify):
+    """Return normalized liked-song items in the same shape as playlist tracks."""
+    items = paginate(sp.current_user_saved_tracks)
+    normalized = []
+    for item in items:
+        if not item:
+            continue
+        track = item.get("track")
+        if not track or not track.get("id") or track.get("is_local"):
+            continue
+        normalized.append({
+            "added_at": item.get("added_at"),
+            "track": track,
+        })
+    return normalized
