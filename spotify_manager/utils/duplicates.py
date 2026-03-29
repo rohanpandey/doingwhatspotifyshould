@@ -97,12 +97,16 @@ def find_duplicate_entries(tracks: list[dict[str, Any]]) -> list[dict[str, Any]]
                 "name": track.get("name", "Unknown track"),
                 "artist": primary_artist_name(track),
                 "kept_position": first["position"],
+                "kept_name": first["name"],
+                "kept_artist": first["artist"],
                 "match_label": duplicate_match_label(match_key),
             })
         else:
             entry = {
                 "position": index,
                 "track_id": track_id,
+                "name": track.get("name", "Unknown track"),
+                "artist": primary_artist_name(track),
             }
             if isrc_key:
                 seen_by_isrc[isrc_key] = entry

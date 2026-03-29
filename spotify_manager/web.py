@@ -1415,7 +1415,8 @@ def render_duplicates_section(playlists: list[dict[str, Any]], data: dict[str, A
             for playlist in results:
                 track_items = "".join(
                     f"<li>{escape(track['name'])} — {escape(track['artist'])} "
-                    f"<span class='muted'>(position {track['position'] + 1}, matches kept track at "
+                    f"<span class='muted'>(position {track['position'] + 1}, matches "
+                    f"{escape(track['kept_name'])} — {escape(track['kept_artist'])} at "
                     f"position {track['kept_position'] + 1} via {escape(track['match_label'])})</span></li>"
                     for track in playlist["tracks"][:20]
                 )

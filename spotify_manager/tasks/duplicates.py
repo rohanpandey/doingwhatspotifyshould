@@ -28,7 +28,8 @@ def task_duplicates(sp: spotipy.Spotify, dry_run: bool):
         for entry in dupes:
             console.print(
                 f"  pos {entry['position'] + 1:>3}  {entry['name']} — {entry['artist']}  "
-                f"[dim](matches kept track at pos {entry['kept_position'] + 1} via {entry['match_label']})[/dim]"
+                f"[dim](matches '{entry['kept_name']}' — {entry['kept_artist']} at "
+                f"pos {entry['kept_position'] + 1} via {entry['match_label']})[/dim]"
             )
 
         if dry_run:
