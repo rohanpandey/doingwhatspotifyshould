@@ -51,6 +51,9 @@ SPOTIFY_REDIRECT_URI=http://127.0.0.1:8888/callback
 ### 4. Run
 
 ```bash
+# Launch the local web UI
+python -m spotify_manager --web
+
 # Dry-run first — see what would happen, no changes made
 python -m spotify_manager --dry-run
 
@@ -67,6 +70,8 @@ python -m spotify_manager --task 1,2,3,4,5,6
 ```
 
 On first run, a browser window will open for Spotify OAuth. The token is cached in `.spotify_token_cache` for future runs.
+
+When running `--web`, the app starts a local server at `http://127.0.0.1:8000` by default. You can change that with `--host` and `--port`.
 
 ---
 
@@ -182,6 +187,7 @@ spotify-manager/
 │   ├── __main__.py           # Entry point: python -m spotify_manager
 │   ├── auth.py               # OAuth + Spotify client setup
 │   ├── cli.py                # Argument parsing and task dispatch
+│   ├── web.py                # Local browser UI
 │   ├── utils/
 │   │   ├── display.py        # Rich/plain-text console helpers
 │   │   ├── audio.py          # Audio feature helpers + k-means clustering
@@ -229,4 +235,3 @@ spotify-manager/
 - `numpy >= 1.24` (tasks 4, 6)
 - `rich >= 13.0` (optional but strongly recommended — prettier output)
 - Spotify Premium (required for some API endpoints)
-

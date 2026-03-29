@@ -12,6 +12,7 @@ from .tasks.size_audit import task_size_audit
 from .tasks.organise import task_organize_liked
 from .tasks.discovery import task_discovery
 from .tasks.taste_engine import task_taste_engine
+from .web import run_web_app
 
 
 def main():
@@ -20,6 +21,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "examples:\n"
+            "  python -m spotify_manager --web        # launch the local browser UI\n"
             "  python -m spotify_manager              # run tasks 1–4\n"
             "  python -m spotify_manager --dry-run    # preview only, no changes\n"
             "  python -m spotify_manager --task 6     # taste engine only\n"
@@ -34,7 +36,23 @@ def main():
         "--task", default="1,2,3,4",
         help="Comma-separated task numbers to run (default: 1,2,3,4)",
     )
+    parser.add_argument(
+        "--web", action="store_true",
+        help="Launch the local browser UI instead of the terminal workflow",
+    )
+    parser.add_argument(
+        "--host", default="127.0.0.1",
+        help="Host to bind the web UI to (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port", type=int, default=8000,
+        help="Port to bind the web UI to (default: 8000)",
+    )
     args = parser.parse_args()
+
+    if args.web:
+        run_web_app(host=args.host, port=args.port)
+        return
 
     tasks_to_run = {int(t.strip()) for t in args.task.split(",") if t.strip().isdigit()}
     dry_run      = args.dry_run
