@@ -79,7 +79,7 @@ When running `--web`, the app starts a local server at `http://127.0.0.1:8000` b
 
 ### Task 1 · Duplicate cleaner
 
-Scans all playlists you own and finds tracks appearing more than once (matched by Spotify track ID). Prompts before removing — tells you exactly which positions will be deleted.
+Scans all playlists you own and finds tracks appearing more than once, even when Spotify IDs differ across versions. It prefers ISRC when available, otherwise falls back to normalized song name + primary artist + duration. Prompts before removing and tells you exactly which positions will be deleted.
 
 ### Task 2 · Never-played finder
 
