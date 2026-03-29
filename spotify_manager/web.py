@@ -21,6 +21,7 @@ import spotipy
 from .auth import get_spotify
 from .models.taste_model import TasteModel
 from .tasks.organise import GENRE_BUCKETS, MOOD_LABELS
+from .utils.duplicates import build_duplicate_removal_payload, find_duplicate_entries
 from .utils.audio import HAS_ML, _batch_audio_features, _cluster_tracks, _similarity_score
 from .utils.display import console
 from .utils.spotify import get_all_playlists, get_playlist_tracks, paginate
@@ -645,21 +646,7 @@ def scan_duplicates(sp: spotipy.Spotify) -> list[dict[str, Any]]:
     results = []
     for playlist in get_all_playlists(sp):
         tracks = get_playlist_tracks(sp, playlist["id"])
-        seen: dict[str, int] = {}
-        duplicates = []
-        for index, item in enumerate(tracks):
-            track = item.get("track") or {}
-            track_id = track.get("id")
-            if not track_id:
-                continue
-            if track_id in seen:
-                duplicates.append({
-                    "position": index + 1,
-                    "name": track.get("name", "Unknown track"),
-                    "track_id": track_id,
-                })
-            else:
-                seen[track_id] = index
+        duplicates = find_duplicate_entries(tracks)
         if duplicates:
             results.append({
                 "playlist_id": playlist["id"],
@@ -677,30 +664,15 @@ def remove_duplicates(sp: spotipy.Spotify, playlist_id: str) -> dict[str, Any]:
         raise ValueError("That playlist was not found in your library.")
 
     tracks = get_playlist_tracks(sp, playlist_id)
-    seen: dict[str, int] = {}
-    duplicates_by_id: dict[str, list[int]] = defaultdict(list)
-
-    for index, item in enumerate(tracks):
-        track = item.get("track") or {}
-        track_id = track.get("id")
-        if not track_id:
-            continue
-        if track_id in seen:
-            duplicates_by_id[track_id].append(index)
-        else:
-            seen[track_id] = index
-
-    if not duplicates_by_id:
+    duplicates = find_duplicate_entries(tracks)
+    if not duplicates:
         return {"removed": 0, "message": f"'{playlist['name']}' is already clean."}
 
-    payload = [
-        {"uri": f"spotify:track:{track_id}", "positions": positions}
-        for track_id, positions in duplicates_by_id.items()
-    ]
+    payload = build_duplicate_removal_payload(duplicates)
     for start in range(0, len(payload), 100):
         sp.playlist_remove_specific_occurrences_of_items(playlist_id, payload[start:start + 100])
 
-    removed = sum(len(positions) for positions in duplicates_by_id.values())
+    removed = len(duplicates)
     return {"removed": removed, "message": f"Removed {removed} duplicate tracks from '{playlist['name']}'."}
 
 
@@ -741,7 +713,7 @@ def scan_never_played(sp: spotipy.Spotify, cutoff_days: int) -> dict[str, Any]:
 def audit_playlist_sizes(sp: spotipy.Spotify, threshold: int) -> list[dict[str, Any]]:
     oversized = []
     for playlist in get_all_playlists(sp):
-        count = playlist["tracks"]["total"]
+        count = (playlist.get("tracks") or {}).get("total", 0)
         if count > threshold:
             oversized.append({
                 "playlist_id": playlist["id"],
@@ -1225,7 +1197,9 @@ def render_duplicates_section(data: dict[str, Any] | None) -> str:
             blocks = []
             for playlist in results:
                 track_items = "".join(
-                    f"<li>{escape(track['name'])} <span class='muted'>(position {track['position']})</span></li>"
+                    f"<li>{escape(track['name'])} — {escape(track['artist'])} "
+                    f"<span class='muted'>(position {track['position'] + 1}, matches kept track at "
+                    f"position {track['kept_position'] + 1} via {escape(track['match_label'])})</span></li>"
                     for track in playlist["tracks"][:20]
                 )
                 extra_note = ""
@@ -1255,7 +1229,7 @@ def render_duplicates_section(data: dict[str, Any] | None) -> str:
       <div class="panel-head">
         <div class="tag">Task 1</div>
         <h2>Duplicate cleaner</h2>
-        <p class="panel-copy">Scan owned playlists for repeated track IDs and remove confirmed duplicates with one click.</p>
+        <p class="panel-copy">Scan owned playlists for the same song appearing more than once, even when Spotify IDs differ between versions.</p>
       </div>
       <div class="panel-body">
         <form method="post" action="/duplicates">
@@ -1514,8 +1488,10 @@ def render_discovery_section(playlists: list[dict[str, Any]], data: dict[str, An
     options = ["<option value=''>Choose a playlist</option>"]
     for playlist in playlists:
         selected = " selected" if playlist["id"] == state["playlist_id"] else ""
+        track_total = (playlist.get("tracks") or {}).get("total")
+        track_total_label = f"{track_total} tracks" if isinstance(track_total, int) else "track count unknown"
         options.append(
-            f"<option value='{escape(playlist['id'])}'{selected}>{escape(playlist['name'])} ({playlist['tracks']['total']} tracks)</option>"
+            f"<option value='{escape(playlist['id'])}'{selected}>{escape(playlist['name'])} ({track_total_label})</option>"
         )
 
     search_html = ""
