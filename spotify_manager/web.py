@@ -78,6 +78,10 @@ body {
     linear-gradient(180deg, var(--bg) 0%, var(--bg-wash) 100%);
 }
 
+body.is-loading {
+  overflow: hidden;
+}
+
 .shell {
   max-width: 1260px;
   margin: 0 auto;
@@ -185,6 +189,88 @@ body {
 .flash.error {
   background: rgba(180, 35, 24, 0.10);
   color: #7a1d17;
+}
+
+.loading-overlay {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: rgba(31, 41, 51, 0.32);
+  backdrop-filter: blur(12px);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 180ms ease, visibility 180ms ease;
+  z-index: 999;
+}
+
+body.is-loading .loading-overlay {
+  opacity: 1;
+  visibility: visible;
+  pointer-events: auto;
+}
+
+.loading-card {
+  width: min(100%, 520px);
+  padding: 24px;
+  border-radius: var(--radius-xl);
+  background:
+    linear-gradient(135deg, rgba(255, 247, 237, 0.98), rgba(247, 235, 219, 0.94));
+  border: 1px solid rgba(255, 255, 255, 0.72);
+  box-shadow: var(--shadow);
+}
+
+.loading-kicker {
+  color: var(--sea);
+  font-size: 0.76rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.loading-title {
+  margin: 10px 0 6px;
+  font-size: 1.3rem;
+}
+
+.loading-detail {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.loading-bar {
+  position: relative;
+  overflow: hidden;
+  width: 100%;
+  height: 14px;
+  margin-top: 18px;
+  border-radius: 999px;
+  background: rgba(31, 41, 51, 0.08);
+}
+
+.loading-fill {
+  width: 10%;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #c05c3c, #c89b2a, #1f6f78);
+  transition: width 180ms ease;
+}
+
+.loading-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+
+.loading-note {
+  margin-top: 14px;
+  color: var(--muted);
+  font-size: 0.9rem;
 }
 
 .grid {
@@ -464,6 +550,85 @@ summary {
     width: 100%;
   }
 }
+"""
+
+APP_SCRIPT = """
+(() => {
+  const overlay = document.querySelector("[data-loading-overlay]");
+  if (!overlay) return;
+
+  const title = overlay.querySelector("[data-loading-title]");
+  const detail = overlay.querySelector("[data-loading-detail]");
+  const bar = overlay.querySelector("[role='progressbar']");
+  const fill = overlay.querySelector("[data-loading-fill]");
+  const percent = overlay.querySelector("[data-loading-percent]");
+  const elapsed = overlay.querySelector("[data-loading-elapsed]");
+
+  let intervalId = null;
+  let startTime = 0;
+  let progressValue = 10;
+
+  const stopTicker = () => {
+    if (intervalId) {
+      window.clearInterval(intervalId);
+      intervalId = null;
+    }
+  };
+
+  const setProgress = (value) => {
+    progressValue = Math.max(8, Math.min(94, value));
+    fill.style.width = `${progressValue}%`;
+    bar.setAttribute("aria-valuenow", `${Math.round(progressValue)}`);
+    percent.textContent = `${Math.round(progressValue)}%`;
+  };
+
+  const startTicker = () => {
+    stopTicker();
+    startTime = Date.now();
+    intervalId = window.setInterval(() => {
+      const seconds = Math.max(0, Math.floor((Date.now() - startTime) / 1000));
+      elapsed.textContent = `${seconds}s elapsed`;
+      const next = progressValue + (progressValue < 55 ? 7 : progressValue < 80 ? 3 : 1.2);
+      setProgress(next);
+    }, 220);
+  };
+
+  const startLoading = (message, subcopy) => {
+    title.textContent = message || "Working on your Spotify library...";
+    detail.textContent = subcopy || "This progress bar shows that the request is still active while the local server works.";
+    setProgress(10);
+    elapsed.textContent = "0s elapsed";
+    document.body.classList.add("is-loading");
+    startTicker();
+  };
+
+  document.addEventListener("submit", (event) => {
+    const form = event.target;
+    if (!(form instanceof HTMLFormElement)) return;
+    if ((form.method || "").toLowerCase() !== "post") return;
+
+    const submitter = event.submitter;
+    const message =
+      (submitter && submitter.dataset.loadingMessage) ||
+      form.dataset.loadingMessage ||
+      "Working on your Spotify library...";
+    const subcopy =
+      (submitter && submitter.dataset.loadingDetail) ||
+      form.dataset.loadingDetail ||
+      "This progress bar shows that the request is still active while the local server works.";
+
+    form.querySelectorAll("button, input[type='submit']").forEach((element) => {
+      element.disabled = true;
+    });
+
+    startLoading(message, subcopy);
+  }, true);
+
+  window.addEventListener("pageshow", () => {
+    stopTicker();
+    document.body.classList.remove("is-loading");
+  });
+})();
 """
 
 
@@ -1169,7 +1334,23 @@ def render_dashboard(
       </p>
     </section>
   </main>
+  <div class="loading-overlay" data-loading-overlay aria-live="polite" aria-busy="true">
+    <div class="loading-card">
+      <div class="loading-kicker">Working</div>
+      <h2 class="loading-title" data-loading-title>Working on your Spotify library...</h2>
+      <p class="loading-detail" data-loading-detail>This progress bar shows that the request is still active while the local server works.</p>
+      <div class="loading-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="10">
+        <div class="loading-fill" data-loading-fill></div>
+      </div>
+      <div class="loading-meta">
+        <span data-loading-percent>10%</span>
+        <span data-loading-elapsed>0s elapsed</span>
+      </div>
+      <p class="loading-note">The percentage is approximate, but it confirms the scan is still actively running.</p>
+    </div>
+  </div>
   {section_jump}
+  <script>{APP_SCRIPT}</script>
 </body>
 </html>"""
 
@@ -1185,6 +1366,13 @@ def render_flash(flash: dict[str, str] | None) -> str:
         return ""
     kind = "success" if flash.get("kind") == "success" else "error"
     return f'<div class="flash {kind}">{escape(flash.get("message", ""))}</div>'
+
+
+def render_loading_attrs(message: str, detail: str) -> str:
+    return (
+        f'data-loading-message="{escape(message, quote=True)}" '
+        f'data-loading-detail="{escape(detail, quote=True)}"'
+    )
 
 
 def render_duplicates_section(data: dict[str, Any] | None) -> str:
@@ -1211,7 +1399,7 @@ def render_duplicates_section(data: dict[str, Any] | None) -> str:
                       <summary>{escape(playlist['playlist_name'])}</summary>
                       <div class="summary-line">
                         <span class="tag">{playlist['duplicate_count']} duplicates</span>
-                        <form method="post" action="/duplicates">
+                        <form method="post" action="/duplicates" {render_loading_attrs("Removing duplicate songs from this playlist...", "Spotify has to remove the matching positions precisely, so this can take a moment on larger playlists.")}>
                           <input type="hidden" name="op" value="remove">
                           <input type="hidden" name="playlist_id" value="{escape(playlist['playlist_id'])}">
                           <button class="primary" type="submit">Remove duplicates</button>
@@ -1232,7 +1420,7 @@ def render_duplicates_section(data: dict[str, Any] | None) -> str:
         <p class="panel-copy">Scan owned playlists for the same song appearing more than once, even when Spotify IDs differ between versions.</p>
       </div>
       <div class="panel-body">
-        <form method="post" action="/duplicates">
+        <form method="post" action="/duplicates" {render_loading_attrs("Scanning your playlists for duplicate songs...", "Comparing songs by ISRC when available, otherwise by normalized title, artist, and duration.")}>
           <input type="hidden" name="op" value="scan">
           <div class="button-row">
             <button class="primary" type="submit">Scan playlists</button>
@@ -1286,7 +1474,7 @@ def render_never_played_section(data: dict[str, Any] | None) -> str:
         <p class="panel-copy">Flag tracks that are not in your recent Spotify history and have been sitting in playlists for a while.</p>
       </div>
       <div class="panel-body">
-        <form method="post" action="/never-played">
+        <form method="post" action="/never-played" {render_loading_attrs("Building your never-played review list...", "Checking owned playlists against your recent listening history and added dates.")}>
           <div class="field-grid">
             <label>Older than how many days?
               <input type="number" min="1" max="3650" name="cutoff_days" value="{cutoff_days}">
@@ -1325,7 +1513,7 @@ def render_size_audit_section(data: dict[str, Any] | None) -> str:
                       <td>{item['track_count']}</td>
                       <td>{item['suggested_splits']}</td>
                       <td>
-                        <form method="post" action="/size-audit">
+                        <form method="post" action="/size-audit" {render_loading_attrs("Preparing a smart split preview...", "Fetching playlist audio features and sketching rough mood-based groupings.")}>
                           <input type="hidden" name="op" value="preview">
                           <input type="hidden" name="threshold" value="{threshold}">
                           <input type="hidden" name="playlist_id" value="{escape(item['playlist_id'])}">
@@ -1370,7 +1558,7 @@ def render_size_audit_section(data: dict[str, Any] | None) -> str:
         <p class="panel-copy">Spot oversized playlists fast, then preview rough mood-based split suggestions before you reorganize anything.</p>
       </div>
       <div class="panel-body">
-        <form method="post" action="/size-audit">
+        <form method="post" action="/size-audit" {render_loading_attrs("Auditing playlist sizes...", "Checking your owned playlists and flagging the ones that are getting too large.")}>
           <input type="hidden" name="op" value="scan">
           <div class="field-grid">
             <label>Oversized over this track count
@@ -1438,7 +1626,7 @@ def render_organize_section(data: dict[str, Any] | None) -> str:
         <p class="panel-copy">Preview mood and genre clusters for your liked songs, then optionally create the playlists directly from the UI.</p>
       </div>
       <div class="panel-body">
-        <form method="post" action="/organize-liked">
+        <form method="post" action="/organize-liked" {render_loading_attrs("Organizing your liked songs...", "Spotify data and audio features are being grouped into mood and genre buckets.")}>
           <div class="field-grid">
             <label>Grouping strategy
               <select name="strategy">
@@ -1508,7 +1696,7 @@ def render_discovery_section(playlists: list[dict[str, Any]], data: dict[str, An
         search_html = f"""
         <div class="results">
           <h3>Choose a seed track</h3>
-          <form method="post" action="/discovery">
+          <form method="post" action="/discovery" {render_loading_attrs("Running music discovery...", "Fetching recommendations that match your chosen seed track and playlist energy profile.")}>
             <input type="hidden" name="op" value="run">
             <input type="hidden" name="mode" value="{escape(state['mode'])}">
             <input type="hidden" name="song_query" value="{escape(state['song_query'])}">
@@ -1558,7 +1746,7 @@ def render_discovery_section(playlists: list[dict[str, Any]], data: dict[str, An
         <p class="panel-copy">Blend a seed song, a playlist energy profile, or both to generate recommendations without dropping back into prompt-by-prompt CLI mode.</p>
       </div>
       <div class="panel-body">
-        <form method="post" action="/discovery">
+        <form method="post" action="/discovery" {render_loading_attrs("Starting music discovery...", "Depending on the button you clicked, this will either search for seed tracks or fetch recommendations.")}>
           <div class="field-grid">
             <label>Mode
               <select name="mode">
@@ -1583,8 +1771,8 @@ def render_discovery_section(playlists: list[dict[str, Any]], data: dict[str, An
             </label>
           </div>
           <div class="button-row">
-            <button class="secondary" type="submit" name="op" value="search">Find seed tracks</button>
-            <button class="primary" type="submit" name="op" value="run">Run discovery</button>
+            <button class="secondary" type="submit" name="op" value="search" data-loading-message="Searching for seed tracks..." data-loading-detail="Looking through Spotify's catalog so you can choose the right starting song.">Find seed tracks</button>
+            <button class="primary" type="submit" name="op" value="run" data-loading-message="Running music discovery..." data-loading-detail="Fetching recommendations and scoring how closely they match your target sound.">Run discovery</button>
           </div>
         </form>
         {search_html}
