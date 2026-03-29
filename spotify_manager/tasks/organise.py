@@ -9,7 +9,7 @@ import spotipy
 
 from ..utils.display import HAS_RICH, console, confirm, ask
 from ..utils.spotify import paginate, get_all_playlists
-from ..utils.audio import HAS_ML, _batch_audio_features, _cluster_tracks
+from ..utils.audio import HAS_ML, _batch_audio_features_with_ids, _cluster_tracks
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -129,7 +129,8 @@ def task_organize_liked(sp: spotipy.Spotify, dry_run: bool):
     if do_mood:
         n_clusters = int(ask("How many mood playlists? (4–6 recommended)", default="4"))
         console.print("\nFetching audio features for mood clustering…")
-        features = _batch_audio_features(sp, ids)
+        feature_rows = _batch_audio_features_with_ids(sp, ids)
+        features = [features for _, features in feature_rows]
 
         if not features:
             console.print("[red]Could not fetch audio features — skipping mood grouping.[/red]")
@@ -137,9 +138,11 @@ def task_organize_liked(sp: spotipy.Spotify, dry_run: bool):
             labels, cluster_info = _cluster_tracks(features, n_clusters)
 
             mood_clusters: dict[int, list] = defaultdict(list)
-            for i, label in enumerate(labels):
-                if i < len(liked_tracks):
-                    mood_clusters[label].append(liked_tracks[i])
+            tracks_by_id = {track["id"]: track for track in liked_tracks}
+            for (track_id, _), label in zip(feature_rows, labels):
+                track = tracks_by_id.get(track_id)
+                if track:
+                    mood_clusters[int(label)].append(track)
 
             console.print("\n[bold]Proposed mood playlists:[/bold]")
             if HAS_RICH:

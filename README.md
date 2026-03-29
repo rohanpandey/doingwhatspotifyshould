@@ -1,6 +1,6 @@
 # spotify-manager
 
-A personal Spotify toolkit that cleans up your library, organises your liked songs, and builds a self-improving music discovery engine — replacing the "you've already heard all of this" problem with Spotify Radio.
+A personal Spotify toolkit with both a CLI and a local web UI for playlist cleanup, liked-song organisation, and self-improving music discovery.
 
 ---
 
@@ -14,6 +14,17 @@ A personal Spotify toolkit that cleans up your library, organises your liked son
 | 4 · Liked songs organiser | `--task 4` | Clusters liked songs into genre and/or mood playlists |
 | 5 · One-shot discovery | `--task 5` | Finds new tracks similar to a song or a playlist's energy |
 | 6 · Taste engine | `--task 6` | Self-improving discovery that learns from your ratings over time |
+
+---
+
+## Interfaces
+
+- **Web UI** — `python -m spotify_manager --web`
+  Tasks 1–5 are available in the browser. Tasks 1–3 operate on a selected playlist from a dropdown, and long-running actions show an in-page loading/progress overlay.
+- **CLI** — `python -m spotify_manager ...`
+  All six tasks are available here, including the full interactive Taste Engine session.
+
+Task 6 is still primarily a CLI workflow because it depends on per-track rating input during a discovery session.
 
 ---
 
@@ -73,13 +84,21 @@ On first run, a browser window will open for Spotify OAuth. The token is cached 
 
 When running `--web`, the app starts a local server at `http://127.0.0.1:8000` by default. You can change that with `--host` and `--port`.
 
+In the browser UI:
+
+- Task 1 scans one selected playlist for duplicate songs
+- Task 2 reviews one selected playlist for older tracks not seen in your recent listening history
+- Task 3 audits one selected playlist against a size threshold and can preview a smart split
+- Task 4 organizes your liked songs
+- Task 5 runs one-shot discovery
+
 ---
 
 ## Task reference
 
 ### Task 1 · Duplicate cleaner
 
-Scans all playlists you own and finds tracks appearing more than once, even when Spotify IDs differ across versions. It prefers ISRC when available, otherwise falls back to normalized song name + primary artist + duration. Prompts before removing and tells you exactly which positions will be deleted.
+Scans playlists you own and finds the same song appearing more than once, even when Spotify IDs differ across versions. It prefers ISRC when available, otherwise falls back to normalized song name + primary artist + duration bucket. Prompts before removing and tells you exactly which positions will be deleted.
 
 ### Task 2 · Never-played finder
 
@@ -191,6 +210,7 @@ spotify-manager/
 │   ├── utils/
 │   │   ├── display.py        # Rich/plain-text console helpers
 │   │   ├── audio.py          # Audio feature helpers + k-means clustering
+│   │   ├── duplicates.py     # Semantic duplicate matching helpers
 │   │   └── spotify.py        # Pagination and library helpers
 │   ├── models/
 │   │   └── taste_model.py    # TasteModel class + session log functions
@@ -224,6 +244,8 @@ spotify-manager/
 **On feature weights** — the gradient-boosted classifier needs both positive (loved/liked) and negative (skipped/disliked) examples to learn anything meaningful. If you skip everything, the weights won't update. Rate honestly for best results. Temporal decay means recent ratings influence the model more than older ones, so your tastes can shift over time without manual resets.
 
 **On the `.env` file** — never commit it. The `.env.example` template is safe to commit; `.env` is gitignored.
+
+**On missing audio features** — Spotify can omit audio features for some tracks. The clustering and split-preview paths now keep track IDs aligned with returned feature rows so missing entries do not scramble grouping results.
 
 ---
 

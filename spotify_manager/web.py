@@ -22,7 +22,7 @@ from .auth import get_spotify
 from .models.taste_model import TasteModel
 from .tasks.organise import GENRE_BUCKETS, MOOD_LABELS
 from .utils.duplicates import build_duplicate_removal_payload, find_duplicate_entries
-from .utils.audio import HAS_ML, _batch_audio_features, _cluster_tracks, _similarity_score
+from .utils.audio import HAS_ML, _batch_audio_features, _batch_audio_features_with_ids, _cluster_tracks, _similarity_score
 from .utils.display import console
 from .utils.spotify import get_all_playlists, get_playlist_tracks, paginate
 
@@ -662,30 +662,35 @@ def build_app():
                 try:
                     if path == "/duplicates":
                         active_section = "duplicates"
+                        playlist_id = get_value(form, "playlist_id")
                         op = get_value(form, "op", "scan")
                         if op == "remove":
-                            removal = remove_duplicates(sp, get_value(form, "playlist_id"))
+                            removal = remove_duplicates(sp, playlist_id)
                             flash = {"kind": "success", "message": removal["message"]}
                         sections["duplicates"] = {
-                            "results": scan_duplicates(sp),
+                            "playlist_id": playlist_id,
+                            "results": scan_duplicates(sp, playlist_id),
                         }
                     elif path == "/never-played":
                         active_section = "never-played"
+                        playlist_id = get_value(form, "playlist_id")
                         days = to_int(get_value(form, "cutoff_days", "30"), 30, minimum=1, maximum=3650)
                         sections["never_played"] = {
+                            "playlist_id": playlist_id,
                             "cutoff_days": days,
-                            "report": scan_never_played(sp, days),
+                            "report": scan_never_played(sp, playlist_id, days),
                         }
                     elif path == "/size-audit":
                         active_section = "size-audit"
+                        playlist_id = get_value(form, "playlist_id")
                         threshold = to_int(get_value(form, "threshold", "80"), 80, minimum=1, maximum=10000)
                         op = get_value(form, "op", "scan")
                         sections["size_audit"] = {
+                            "playlist_id": playlist_id,
                             "threshold": threshold,
-                            "report": audit_playlist_sizes(sp, threshold),
+                            "report": audit_playlist_sizes(sp, playlist_id, threshold),
                         }
                         if op == "preview":
-                            playlist_id = get_value(form, "playlist_id")
                             sections["size_audit"]["preview"] = build_smart_split_preview(sp, playlist_id)
                     elif path == "/organize-liked":
                         active_section = "organize-liked"
@@ -745,6 +750,9 @@ def build_app():
                     flash = {"kind": "error", "message": str(exc)}
 
             html = render_dashboard(overview, playlists, sections, flash, active_section)
+        except SystemExit as exc:  # pragma: no cover - auth helper exits on missing credentials
+            status = "500 Internal Server Error"
+            html = render_error_page(RuntimeError(f"Spotify credentials are missing or invalid (exit code {exc.code})."))
         except Exception as exc:  # pragma: no cover - best effort browser diagnostics
             status = "500 Internal Server Error"
             html = render_error_page(exc)
@@ -807,26 +815,34 @@ def load_dashboard_context(sp: spotipy.Spotify) -> tuple[dict[str, Any], list[di
     return overview, playlists
 
 
-def scan_duplicates(sp: spotipy.Spotify) -> list[dict[str, Any]]:
+def require_playlist(playlists: list[dict[str, Any]], playlist_id: str) -> dict[str, Any]:
+    if not playlist_id:
+        raise ValueError("Choose a playlist first.")
+    playlist = next((item for item in playlists if item["id"] == playlist_id), None)
+    if not playlist:
+        raise ValueError("That playlist was not found in your owned playlists.")
+    return playlist
+
+
+def scan_duplicates(sp: spotipy.Spotify, playlist_id: str) -> list[dict[str, Any]]:
+    playlists = get_all_playlists(sp)
+    playlist = require_playlist(playlists, playlist_id)
     results = []
-    for playlist in get_all_playlists(sp):
-        tracks = get_playlist_tracks(sp, playlist["id"])
-        duplicates = find_duplicate_entries(tracks)
-        if duplicates:
-            results.append({
-                "playlist_id": playlist["id"],
-                "playlist_name": playlist["name"],
-                "duplicate_count": len(duplicates),
-                "tracks": duplicates,
-            })
-    results.sort(key=lambda item: (-item["duplicate_count"], item["playlist_name"].lower()))
+    tracks = get_playlist_tracks(sp, playlist["id"])
+    duplicates = find_duplicate_entries(tracks)
+    if duplicates:
+        results.append({
+            "playlist_id": playlist["id"],
+            "playlist_name": playlist["name"],
+            "duplicate_count": len(duplicates),
+            "tracks": duplicates,
+        })
     return results
 
 
 def remove_duplicates(sp: spotipy.Spotify, playlist_id: str) -> dict[str, Any]:
-    playlist = next((p for p in get_all_playlists(sp) if p["id"] == playlist_id), None)
-    if not playlist:
-        raise ValueError("That playlist was not found in your library.")
+    playlists = get_all_playlists(sp)
+    playlist = require_playlist(playlists, playlist_id)
 
     tracks = get_playlist_tracks(sp, playlist_id)
     duplicates = find_duplicate_entries(tracks)
@@ -841,30 +857,30 @@ def remove_duplicates(sp: spotipy.Spotify, playlist_id: str) -> dict[str, Any]:
     return {"removed": removed, "message": f"Removed {removed} duplicate tracks from '{playlist['name']}'."}
 
 
-def scan_never_played(sp: spotipy.Spotify, cutoff_days: int) -> dict[str, Any]:
+def scan_never_played(sp: spotipy.Spotify, playlist_id: str, cutoff_days: int) -> dict[str, Any]:
     recent = sp.current_user_recently_played(limit=50)
     played_ids = {item["track"]["id"] for item in recent.get("items", []) if item.get("track")}
     cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=cutoff_days)
+    playlist = require_playlist(get_all_playlists(sp), playlist_id)
 
     rows = []
-    for playlist in get_all_playlists(sp):
-        for item in get_playlist_tracks(sp, playlist["id"]):
-            track = item.get("track") or {}
-            track_id = track.get("id")
-            added_at = item.get("added_at")
-            if not track_id or not added_at:
-                continue
-            try:
-                added_dt = datetime.datetime.strptime(added_at, "%Y-%m-%dT%H:%M:%SZ")
-            except ValueError:
-                continue
-            if track_id not in played_ids and added_dt < cutoff:
-                rows.append({
-                    "playlist": playlist["name"],
-                    "track": track.get("name", "Unknown track"),
-                    "artist": (track.get("artists") or [{"name": "Unknown artist"}])[0]["name"],
-                    "added": added_at[:10],
-                })
+    for item in get_playlist_tracks(sp, playlist["id"]):
+        track = item.get("track") or {}
+        track_id = track.get("id")
+        added_at = item.get("added_at")
+        if not track_id or not added_at:
+            continue
+        try:
+            added_dt = datetime.datetime.strptime(added_at, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            continue
+        if track_id not in played_ids and added_dt < cutoff:
+            rows.append({
+                "playlist": playlist["name"],
+                "track": track.get("name", "Unknown track"),
+                "artist": (track.get("artists") or [{"name": "Unknown artist"}])[0]["name"],
+                "added": added_at[:10],
+            })
 
     rows.sort(key=lambda row: (row["playlist"].lower(), row["added"], row["track"].lower()))
     visible_rows = rows[:250]
@@ -875,32 +891,29 @@ def scan_never_played(sp: spotipy.Spotify, cutoff_days: int) -> dict[str, Any]:
     }
 
 
-def audit_playlist_sizes(sp: spotipy.Spotify, threshold: int) -> list[dict[str, Any]]:
-    oversized = []
-    for playlist in get_all_playlists(sp):
-        count = (playlist.get("tracks") or {}).get("total", 0)
-        if count > threshold:
-            oversized.append({
-                "playlist_id": playlist["id"],
-                "playlist_name": playlist["name"],
-                "track_count": count,
-                "suggested_splits": math.ceil(count / threshold),
-            })
-    oversized.sort(key=lambda item: (-item["track_count"], item["playlist_name"].lower()))
-    return oversized
+def audit_playlist_sizes(sp: spotipy.Spotify, playlist_id: str, threshold: int) -> list[dict[str, Any]]:
+    playlist = require_playlist(get_all_playlists(sp), playlist_id)
+    count = (playlist.get("tracks") or {}).get("total", 0)
+    if count <= threshold:
+        return []
+    return [{
+        "playlist_id": playlist["id"],
+        "playlist_name": playlist["name"],
+        "track_count": count,
+        "suggested_splits": math.ceil(count / threshold),
+    }]
 
 
 def build_smart_split_preview(sp: spotipy.Spotify, playlist_id: str) -> dict[str, Any]:
     if not HAS_ML:
         raise ValueError("Smart split preview needs numpy and scikit-learn installed.")
 
-    playlist = next((p for p in get_all_playlists(sp) if p["id"] == playlist_id), None)
-    if not playlist:
-        raise ValueError("That playlist was not found in your owned playlists.")
+    playlist = require_playlist(get_all_playlists(sp), playlist_id)
 
     tracks = get_playlist_tracks(sp, playlist_id)
     ids = [item["track"]["id"] for item in tracks if item.get("track") and item["track"].get("id")]
-    features = _batch_audio_features(sp, ids)
+    feature_rows = _batch_audio_features_with_ids(sp, ids)
+    features = [features for _, features in feature_rows]
     if len(features) < 2:
         raise ValueError("This playlist does not have enough audio features for a split preview.")
 
@@ -908,7 +921,7 @@ def build_smart_split_preview(sp: spotipy.Spotify, playlist_id: str) -> dict[str
     labels, cluster_info = _cluster_tracks(features, n_clusters)
     suggestions = []
     for index, info in enumerate(cluster_info):
-        track_count = sum(1 for label in labels if label == index)
+        track_count = sum(1 for (_, _), label in zip(feature_rows, labels) if label == index)
         suggestions.append({
             "label": f"Set {index + 1}",
             "track_count": track_count,
@@ -951,14 +964,17 @@ def organize_liked_web(
     if do_mood:
         if not HAS_ML:
             raise ValueError("Mood clustering needs numpy and scikit-learn installed.")
-        features = _batch_audio_features(sp, ids)
+        feature_rows = _batch_audio_features_with_ids(sp, ids)
+        features = [features for _, features in feature_rows]
         if not features:
             raise ValueError("Spotify did not return audio features for the liked songs scan.")
         labels, cluster_info = _cluster_tracks(features, n_clusters)
         mood_clusters: dict[int, list[dict[str, Any]]] = defaultdict(list)
-        for index, label in enumerate(labels):
-            if index < len(liked_tracks):
-                mood_clusters[int(label)].append(liked_tracks[index])
+        tracks_by_id = {track["id"]: track for track in liked_tracks}
+        for (track_id, _), label in zip(feature_rows, labels):
+            track = tracks_by_id.get(track_id)
+            if track:
+                mood_clusters[int(label)].append(track)
 
         result["mood_groups"] = [
             {
@@ -1321,9 +1337,9 @@ def render_dashboard(
     </section>
     {flash_html}
     <section class="grid">
-      {render_duplicates_section(sections.get("duplicates"))}
-      {render_never_played_section(sections.get("never_played"))}
-      {render_size_audit_section(sections.get("size_audit"))}
+      {render_duplicates_section(playlists, sections.get("duplicates"))}
+      {render_never_played_section(playlists, sections.get("never_played"))}
+      {render_size_audit_section(playlists, sections.get("size_audit"))}
       {render_organize_section(sections.get("organize"))}
       {render_discovery_section(playlists, sections.get("discovery"))}
     </section>
@@ -1375,12 +1391,25 @@ def render_loading_attrs(message: str, detail: str) -> str:
     )
 
 
-def render_duplicates_section(data: dict[str, Any] | None) -> str:
+def render_playlist_select(name: str, playlists: list[dict[str, Any]], selected_id: str, placeholder: str = "Choose a playlist") -> str:
+    options = [f"<option value=''>{escape(placeholder)}</option>"]
+    for playlist in playlists:
+        is_selected = " selected" if playlist["id"] == selected_id else ""
+        track_total = (playlist.get("tracks") or {}).get("total")
+        track_total_label = f"{track_total} tracks" if isinstance(track_total, int) else "track count unknown"
+        options.append(
+            f"<option value='{escape(playlist['id'])}'{is_selected}>{escape(playlist['name'])} ({track_total_label})</option>"
+        )
+    return f"<select name=\"{escape(name, quote=True)}\">{''.join(options)}</select>"
+
+
+def render_duplicates_section(playlists: list[dict[str, Any]], data: dict[str, Any] | None) -> str:
+    playlist_id = data.get("playlist_id", "") if data else ""
     results_html = ""
     if data and data.get("results") is not None:
         results = data["results"]
         if not results:
-            results_html = '<div class="results"><h3>No duplicates found.</h3><p class="muted">Your owned playlists look clean right now.</p></div>'
+            results_html = '<div class="results"><h3>No duplicates found.</h3><p class="muted">This playlist looks clean right now.</p></div>'
         else:
             blocks = []
             for playlist in results:
@@ -1417,13 +1446,18 @@ def render_duplicates_section(data: dict[str, Any] | None) -> str:
       <div class="panel-head">
         <div class="tag">Task 1</div>
         <h2>Duplicate cleaner</h2>
-        <p class="panel-copy">Scan owned playlists for the same song appearing more than once, even when Spotify IDs differ between versions.</p>
+        <p class="panel-copy">Scan one playlist for the same song appearing more than once, even when Spotify IDs differ between versions.</p>
       </div>
       <div class="panel-body">
-        <form method="post" action="/duplicates" {render_loading_attrs("Scanning your playlists for duplicate songs...", "Comparing songs by ISRC when available, otherwise by normalized title, artist, and duration.")}>
+        <form method="post" action="/duplicates" {render_loading_attrs("Scanning the selected playlist for duplicate songs...", "Comparing songs by ISRC when available, otherwise by normalized title, artist, and duration.")}>
           <input type="hidden" name="op" value="scan">
+          <div class="field-grid">
+            <label>Playlist
+              {render_playlist_select("playlist_id", playlists, playlist_id)}
+            </label>
+          </div>
           <div class="button-row">
-            <button class="primary" type="submit">Scan playlists</button>
+            <button class="primary" type="submit">Scan playlist</button>
           </div>
         </form>
         {results_html}
@@ -1432,7 +1466,8 @@ def render_duplicates_section(data: dict[str, Any] | None) -> str:
     """
 
 
-def render_never_played_section(data: dict[str, Any] | None) -> str:
+def render_never_played_section(playlists: list[dict[str, Any]], data: dict[str, Any] | None) -> str:
+    playlist_id = data.get("playlist_id", "") if data else ""
     cutoff_days = 30
     results_html = ""
     if data:
@@ -1474,8 +1509,11 @@ def render_never_played_section(data: dict[str, Any] | None) -> str:
         <p class="panel-copy">Flag tracks that are not in your recent Spotify history and have been sitting in playlists for a while.</p>
       </div>
       <div class="panel-body">
-        <form method="post" action="/never-played" {render_loading_attrs("Building your never-played review list...", "Checking owned playlists against your recent listening history and added dates.")}>
+        <form method="post" action="/never-played" {render_loading_attrs("Building your never-played review list...", "Checking the selected playlist against your recent listening history and added dates.")}>
           <div class="field-grid">
+            <label>Playlist
+              {render_playlist_select("playlist_id", playlists, playlist_id)}
+            </label>
             <label>Older than how many days?
               <input type="number" min="1" max="3650" name="cutoff_days" value="{cutoff_days}">
             </label>
@@ -1490,7 +1528,8 @@ def render_never_played_section(data: dict[str, Any] | None) -> str:
     """
 
 
-def render_size_audit_section(data: dict[str, Any] | None) -> str:
+def render_size_audit_section(playlists: list[dict[str, Any]], data: dict[str, Any] | None) -> str:
+    playlist_id = data.get("playlist_id", "") if data else ""
     threshold = 80
     report = []
     preview = None
@@ -1555,18 +1594,21 @@ def render_size_audit_section(data: dict[str, Any] | None) -> str:
       <div class="panel-head">
         <div class="tag">Task 3</div>
         <h2>Playlist size audit</h2>
-        <p class="panel-copy">Spot oversized playlists fast, then preview rough mood-based split suggestions before you reorganize anything.</p>
+        <p class="panel-copy">Check whether a selected playlist is oversized, then preview a rough mood-based split before you reorganize anything.</p>
       </div>
       <div class="panel-body">
-        <form method="post" action="/size-audit" {render_loading_attrs("Auditing playlist sizes...", "Checking your owned playlists and flagging the ones that are getting too large.")}>
+        <form method="post" action="/size-audit" {render_loading_attrs("Auditing the selected playlist...", "Checking whether this playlist is over your chosen size threshold.")}>
           <input type="hidden" name="op" value="scan">
           <div class="field-grid">
+            <label>Playlist
+              {render_playlist_select("playlist_id", playlists, playlist_id)}
+            </label>
             <label>Oversized over this track count
               <input type="number" min="1" max="10000" name="threshold" value="{threshold}">
             </label>
           </div>
           <div class="button-row">
-            <button class="primary" type="submit">Audit playlists</button>
+            <button class="primary" type="submit">Audit playlist</button>
           </div>
         </form>
         {report_html}

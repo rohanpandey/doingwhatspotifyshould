@@ -33,6 +33,24 @@ def _batch_audio_features(sp, ids: list[str]) -> list[dict]:
     return all_features
 
 
+def _batch_audio_features_with_ids(sp, ids: list[str]) -> list[tuple[str, dict]]:
+    """
+    Fetch audio features while preserving the requested track IDs.
+
+    Spotify can return `None` for some tracks; callers that need to keep
+    features aligned with specific source tracks should use this helper.
+    """
+    rows = []
+    for start in range(0, len(ids), 100):
+        batch = ids[start:start + 100]
+        result = sp.audio_features(batch) or []
+        for track_id, features in zip(batch, result):
+            if features:
+                rows.append((track_id, features))
+        time.sleep(0.1)
+    return rows
+
+
 # ── K-means clustering ─────────────────────────────────────────────────────────
 
 def _cluster_tracks(features: list[dict], n_clusters: int):

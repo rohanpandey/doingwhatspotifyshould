@@ -22,7 +22,7 @@ import spotipy
 
 from ..utils.display import HAS_RICH, console, confirm, ask
 from ..utils.spotify import paginate, get_all_playlists, get_playlist_tracks
-from ..utils.audio import _batch_audio_features, _similarity_score, _weighted_similarity
+from ..utils.audio import _batch_audio_features, _batch_audio_features_with_ids, _similarity_score, _weighted_similarity
 from ..models.taste_model import (
     TasteModel, log_session, load_session_log,
     FEATURE_KEYS_FULL, MAX_LOVED_VECTORS,
@@ -121,11 +121,13 @@ def _build_taste_model(sp: spotipy.Spotify, model: TasteModel):
     console.print(f"  {len(model.known_ids):,} tracks indexed as 'known' (will never be recommended)")
 
     console.print("\n[bold]Step 2 · Fetching audio features for liked songs…[/bold]")
-    features = _batch_audio_features(sp, liked_ids)
+    feature_rows = _batch_audio_features_with_ids(sp, liked_ids)
+    features = [features for _, features in feature_rows]
+    feature_track_ids = [track_id for track_id, _ in feature_rows]
     console.print(f"  Features fetched for {len(features):,} tracks")
 
     n_clusters = int(ask("How many taste clusters to model? (3–5 recommended)", default="4"))
-    model.build_clusters(features, liked_ids, n_clusters=n_clusters)
+    model.build_clusters(features, feature_track_ids, n_clusters=n_clusters)
     console.print(f"  Fitted {len(model.clusters)} clusters (GMM, full covariance)")
 
     try:

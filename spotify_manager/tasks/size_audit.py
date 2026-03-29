@@ -8,7 +8,7 @@ import spotipy
 
 from ..utils.display import HAS_RICH, console, ask
 from ..utils.spotify import get_all_playlists, get_playlist_tracks
-from ..utils.audio import HAS_ML, _batch_audio_features, _cluster_tracks
+from ..utils.audio import HAS_ML, _batch_audio_features_with_ids, _cluster_tracks
 
 
 def task_size_audit(sp: spotipy.Spotify, dry_run: bool):
@@ -61,7 +61,8 @@ def _smart_split_preview(sp: spotipy.Spotify, pl_id: str, pl_name: str):
     tracks = get_playlist_tracks(sp, pl_id)
     ids    = [t["track"]["id"] for t in tracks]
 
-    features = _batch_audio_features(sp, ids)
+    feature_rows = _batch_audio_features_with_ids(sp, ids)
+    features = [features for _, features in feature_rows]
     if not features:
         console.print("[red]Could not fetch audio features.[/red]")
         return
@@ -71,7 +72,7 @@ def _smart_split_preview(sp: spotipy.Spotify, pl_id: str, pl_name: str):
 
     console.print(f"\nSuggested {n_clusters} sub-playlists:")
     for i, info in enumerate(cluster_info):
-        tracks_in = [ids[j] for j, l in enumerate(labels) if l == i]
+        tracks_in = [track_id for (track_id, _), label in zip(feature_rows, labels) if label == i]
         console.print(
             f"  Sub-playlist {i+1}: ~{len(tracks_in)} tracks | "
             f"energy={info['energy']:.2f}, valence={info['valence']:.2f}, "
