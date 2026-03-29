@@ -80,7 +80,7 @@ python -m spotify_manager --task 6
 python -m spotify_manager --task 1,2,3,4,5,6
 ```
 
-On first run, a browser window will open for Spotify OAuth. The token is cached in `.spotify_token_cache` for future runs.
+On first run, a browser window will open for Spotify OAuth. The token is cached in `.spotify_token_cache` for future runs. If you authenticated before saved-track editing was added and liked-song cleanup now fails, delete `.spotify_token_cache` once and re-authenticate so Spotify grants the `user-library-modify` scope.
 
 When running `--web`, the app starts a local server at `http://127.0.0.1:8000` by default. You can change that with `--host` and `--port`.
 
@@ -98,7 +98,7 @@ In the browser UI:
 
 ### Task 1 · Duplicate cleaner
 
-Scans playlists you own and finds the same song appearing more than once, even when Spotify IDs differ across versions. It prefers ISRC when available, otherwise falls back to normalized song name + primary artist + duration bucket. Prompts before removing and tells you exactly which positions will be deleted.
+Scans playlists you own, and optionally your Liked Songs, to find the same song appearing more than once even when Spotify IDs differ across versions. It prefers ISRC when available, otherwise falls back to normalized song name + primary artist + duration bucket. Prompts before removing and tells you exactly which positions will be deleted.
 
 ### Task 2 · Never-played finder
 

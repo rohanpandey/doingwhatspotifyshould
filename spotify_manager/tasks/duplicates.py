@@ -6,7 +6,7 @@ import spotipy
 
 from ..utils.display import HAS_RICH, console, confirm, ask
 from ..utils.duplicates import build_duplicate_removal_payload, find_duplicate_entries
-from ..utils.spotify import get_all_playlists, get_liked_tracks, get_playlist_tracks
+from ..utils.spotify import get_all_playlists, get_liked_tracks, get_playlist_tracks, remove_liked_tracks
 
 
 def task_duplicates(sp: spotipy.Spotify, dry_run: bool):
@@ -45,9 +45,7 @@ def task_duplicates(sp: spotipy.Spotify, dry_run: bool):
         if confirm(f"  Remove {len(dupes)} duplicate(s) from '{source_name}'?", dry_run=False):
             if source_kind == "liked":
                 duplicate_ids = [entry["track_id"] for entry in dupes]
-                for chunk_start in range(0, len(duplicate_ids), 50):
-                    chunk = duplicate_ids[chunk_start:chunk_start + 50]
-                    sp.current_user_saved_tracks_delete(chunk)
+                remove_liked_tracks(sp, duplicate_ids)
             else:
                 tracks_payload = build_duplicate_removal_payload(dupes)
                 # Spotify allows max 100 tracks per remove call

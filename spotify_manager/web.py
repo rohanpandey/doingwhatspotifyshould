@@ -24,7 +24,7 @@ from .tasks.organise import GENRE_BUCKETS, MOOD_LABELS
 from .utils.duplicates import build_duplicate_removal_payload, find_duplicate_entries
 from .utils.audio import HAS_ML, _batch_audio_features, _batch_audio_features_with_ids, _cluster_tracks, _similarity_score
 from .utils.display import console
-from .utils.spotify import get_all_playlists, get_liked_tracks, get_playlist_tracks, paginate
+from .utils.spotify import get_all_playlists, get_liked_tracks, get_playlist_tracks, paginate, remove_liked_tracks
 
 DISCOVERY_FEATURE_KEYS = [
     "energy",
@@ -856,8 +856,7 @@ def remove_duplicates(sp: spotipy.Spotify, source_id: str) -> dict[str, Any]:
 
     if source_id == LIKED_SONGS_SOURCE_ID:
         duplicate_ids = [entry["track_id"] for entry in duplicates]
-        for start in range(0, len(duplicate_ids), 50):
-            sp.current_user_saved_tracks_delete(duplicate_ids[start:start + 50])
+        remove_liked_tracks(sp, duplicate_ids)
     else:
         payload = build_duplicate_removal_payload(duplicates)
         for start in range(0, len(payload), 100):
