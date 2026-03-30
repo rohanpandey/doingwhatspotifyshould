@@ -26,6 +26,8 @@ A personal Spotify toolkit with both a CLI and a local web UI for playlist clean
 
 Task 6 is still primarily a CLI workflow because it depends on per-track rating input during a discovery session.
 
+For a repository and pipeline map, see [docs/architecture.md](docs/architecture.md).
+
 ---
 
 ## Quickstart

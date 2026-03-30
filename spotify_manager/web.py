@@ -56,6 +56,8 @@ _dashboard_cache: dict[str, Any] = {
     "expires_at": 0.0,
 }
 JOB_POLL_INTERVAL_MS = 2000
+JOB_RETENTION_SECONDS = 30 * 60
+MAX_RETAINED_JOBS = 40
 
 
 @dataclass
@@ -105,6 +107,7 @@ class JobManager:
 
     def enqueue(self, job: BackgroundJob, runner):
         with self._lock:
+            self._prune_locked()
             active = self.get_active()
             if active:
                 return None, active
@@ -112,6 +115,32 @@ class JobManager:
             self._active_job_id = job.id
         self._queue.put((job.id, runner))
         return job, None
+
+    def _prune_locked(self):
+        now = time.time()
+        removable = []
+        for job_id, job in self._jobs.items():
+            if job.is_active:
+                continue
+            finished_at = job.finished_at or job.created_at
+            if now - finished_at > JOB_RETENTION_SECONDS:
+                removable.append((finished_at, job_id))
+
+        removable.sort()
+        while len(self._jobs) - len(removable) > MAX_RETAINED_JOBS:
+            finished_jobs = sorted(
+                (
+                    ((job.finished_at or job.created_at), job_id)
+                    for job_id, job in self._jobs.items()
+                    if not job.is_active and job_id not in {job_id for _, job_id in removable}
+                )
+            )
+            if not finished_jobs:
+                break
+            removable.append(finished_jobs[0])
+
+        for _, job_id in removable:
+            self._jobs.pop(job_id, None)
 
     def _run_forever(self):
         while True:
@@ -144,6 +173,7 @@ class JobManager:
                 with self._lock:
                     if self._active_job_id == job_id:
                         self._active_job_id = None
+                    self._prune_locked()
                 self._queue.task_done()
 
 
@@ -792,7 +822,7 @@ APP_SCRIPT = """
     });
     if (pollUrl && pollMs > 0) {
       window.setTimeout(() => {
-        window.location.href = pollUrl + window.location.hash;
+        window.location.href = pollUrl;
       }, pollMs);
     }
   }
@@ -1231,7 +1261,7 @@ def load_dashboard_context(sp: spotipy.Spotify) -> tuple[dict[str, Any], list[di
     now = time.time()
     cached_overview = _dashboard_cache.get("overview")
     cached_playlists = _dashboard_cache.get("playlists")
-    if cached_overview and cached_playlists and now < float(_dashboard_cache.get("expires_at", 0.0)):
+    if cached_overview is not None and cached_playlists is not None and now < float(_dashboard_cache.get("expires_at", 0.0)):
         return cached_overview, cached_playlists
 
     try:
@@ -1241,7 +1271,7 @@ def load_dashboard_context(sp: spotipy.Spotify) -> tuple[dict[str, Any], list[di
         recent = sp.current_user_recently_played(limit=10)
         model = TasteModel.load()
     except spotipy.SpotifyException:
-        if cached_overview and cached_playlists:
+        if cached_overview is not None and cached_playlists is not None:
             return cached_overview, cached_playlists
         raise
 
