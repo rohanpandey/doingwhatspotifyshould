@@ -6,7 +6,13 @@ import spotipy
 
 from ..utils.display import HAS_RICH, console, confirm, ask
 from ..utils.duplicates import build_duplicate_removal_payload, find_duplicate_entries
-from ..utils.spotify import get_all_playlists, get_liked_tracks, get_playlist_tracks, remove_liked_tracks
+from ..utils.spotify import (
+    get_all_playlists,
+    get_liked_tracks,
+    get_playlist_tracks,
+    invalidate_playlist_tracks_cache,
+    remove_liked_tracks,
+)
 
 
 def task_duplicates(sp: spotipy.Spotify, dry_run: bool):
@@ -20,7 +26,10 @@ def task_duplicates(sp: spotipy.Spotify, dry_run: bool):
     else:
         include_liked = ask("Also scan Liked Songs? (y/n)", default="y").lower().startswith("y")
 
-    sources = [("playlist", pl["id"], pl["name"], get_playlist_tracks(sp, pl["id"])) for pl in get_all_playlists(sp)]
+    sources = [
+        ("playlist", pl["id"], pl["name"], get_playlist_tracks(sp, pl["id"], pl.get("snapshot_id")))
+        for pl in get_all_playlists(sp)
+    ]
     if include_liked:
         sources.append(("liked", "__liked_songs__", "Liked Songs", get_liked_tracks(sp)))
 
@@ -52,6 +61,7 @@ def task_duplicates(sp: spotipy.Spotify, dry_run: bool):
                 for chunk_start in range(0, len(tracks_payload), 100):
                     chunk = tracks_payload[chunk_start:chunk_start + 100]
                     sp.playlist_remove_specific_occurrences_of_items(source_id, chunk)
+                invalidate_playlist_tracks_cache(source_id)
             console.print(f"  [green]✓ Removed {len(dupes)} duplicate(s)[/green]")
             total_removed += len(dupes)
 

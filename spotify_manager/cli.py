@@ -13,6 +13,7 @@ from .tasks.organise import task_organize_liked
 from .tasks.discovery import task_discovery
 from .tasks.taste_engine import task_taste_engine
 from .web import run_web_app
+from .utils.spotify_client import spotify_task_context
 
 
 def main():
@@ -74,16 +75,22 @@ def main():
     sp = get_spotify()
 
     if 1 in tasks_to_run:
-        task_duplicates(sp, dry_run)
+        with spotify_task_context("cli.task_1_duplicates"):
+            task_duplicates(sp, dry_run)
     if 2 in tasks_to_run:
-        task_never_played(sp, dry_run)
+        with spotify_task_context("cli.task_2_never_played"):
+            task_never_played(sp, dry_run)
     if 3 in tasks_to_run:
-        task_size_audit(sp, dry_run)
+        with spotify_task_context("cli.task_3_size_audit"):
+            task_size_audit(sp, dry_run)
     if 4 in tasks_to_run:
-        task_organize_liked(sp, dry_run)
+        with spotify_task_context("cli.task_4_organize_liked"):
+            task_organize_liked(sp, dry_run)
     if 5 in tasks_to_run:
-        task_discovery(sp, dry_run)
+        with spotify_task_context("cli.task_5_discovery"):
+            task_discovery(sp, dry_run)
     if 6 in tasks_to_run:
-        task_taste_engine(sp, dry_run)
+        with spotify_task_context("cli.task_6_taste_engine"):
+            task_taste_engine(sp, dry_run)
 
     console.rule("[bold green]Done[/bold green]")

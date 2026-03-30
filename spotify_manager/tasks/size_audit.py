@@ -21,7 +21,7 @@ def task_size_audit(sp: spotipy.Spotify, dry_run: bool):
     for pl in playlists:
         count = pl["tracks"]["total"]
         if count > threshold:
-            oversized.append((pl["name"], count, pl["id"]))
+            oversized.append((pl["name"], count, pl["id"], pl.get("snapshot_id")))
 
     if not oversized:
         console.print(f"[green]All playlists are under {threshold} tracks. 🎉[/green]")
@@ -35,12 +35,12 @@ def task_size_audit(sp: spotipy.Spotify, dry_run: bool):
         table.add_column("Playlist",        style="yellow")
         table.add_column("Tracks",          justify="right", style="bold red")
         table.add_column("Suggested Split", style="dim")
-        for name, count, _ in oversized:
+        for name, count, _, _ in oversized:
             splits = math.ceil(count / threshold)
             table.add_row(name, str(count), f"~{splits} sub-playlists of ~{threshold}")
         console.print(table)
     else:
-        for name, count, _ in oversized:
+        for name, count, _, _ in oversized:
             splits = math.ceil(count / threshold)
             print(f"  {name}: {count} tracks → suggest {splits} sub-playlists")
 
@@ -51,14 +51,14 @@ def task_size_audit(sp: spotipy.Spotify, dry_run: bool):
         if pl_name:
             match = next((p for p in oversized if p[0].lower() == pl_name.lower()), None)
             if match:
-                _smart_split_preview(sp, match[2], match[0])
+                _smart_split_preview(sp, match[2], match[0], match[3])
             else:
                 console.print("[red]Playlist not found in oversized list.[/red]")
 
 
-def _smart_split_preview(sp: spotipy.Spotify, pl_id: str, pl_name: str):
+def _smart_split_preview(sp: spotipy.Spotify, pl_id: str, pl_name: str, snapshot_id: str | None = None):
     console.print(f"\n[bold]Analyzing '{pl_name}' for smart split…[/bold]")
-    tracks = get_playlist_tracks(sp, pl_id)
+    tracks = get_playlist_tracks(sp, pl_id, snapshot_id)
     ids    = [t["track"]["id"] for t in tracks]
 
     feature_rows = _batch_audio_features_with_ids(sp, ids)

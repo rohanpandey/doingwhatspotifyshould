@@ -115,7 +115,7 @@ def _build_taste_model(sp: spotipy.Spotify, model: TasteModel):
 
     playlists = get_all_playlists(sp)
     for pl in playlists:
-        for item in get_playlist_tracks(sp, pl["id"]):
+        for item in get_playlist_tracks(sp, pl["id"], pl.get("snapshot_id")):
             model.known_ids.add(item["track"]["id"])
 
     console.print(f"  {len(model.known_ids):,} tracks indexed as 'known' (will never be recommended)")

@@ -28,7 +28,15 @@ from .tasks.organise import GENRE_BUCKETS, MOOD_LABELS
 from .utils.duplicates import build_duplicate_removal_payload, find_duplicate_entries
 from .utils.audio import HAS_ML, _batch_audio_features, _batch_audio_features_with_ids, _cluster_tracks, _similarity_score
 from .utils.display import console
-from .utils.spotify import get_all_playlists, get_liked_tracks, get_playlist_tracks, paginate, remove_liked_tracks
+from .utils.spotify import (
+    get_all_playlists,
+    get_liked_tracks,
+    get_playlist_tracks,
+    invalidate_playlist_tracks_cache,
+    paginate,
+    remove_liked_tracks,
+)
+from .utils.spotify_client import spotify_task_context
 
 DISCOVERY_FEATURE_KEYS = [
     "energy",
@@ -824,8 +832,9 @@ def build_app():
                     )
                     return redirect(start_response, location)
 
-            sp = get_spotify()
-            overview, playlists = load_dashboard_context(sp)
+            with spotify_task_context("web.dashboard"):
+                sp = get_spotify()
+                overview, playlists = load_dashboard_context(sp)
             active_section = None
             flash = None
             sections: dict[str, Any] = {}
@@ -865,7 +874,8 @@ def build_app():
                     try:
                         if not state["song_query"].strip():
                             raise ValueError("Enter a song search before trying to find seed tracks.")
-                        sections["discovery"]["search_results"] = search_seed_tracks(sp, state["song_query"])
+                        with spotify_task_context("web.discovery.search"):
+                            sections["discovery"]["search_results"] = search_seed_tracks(sp, state["song_query"])
                     except spotipy.SpotifyException as exc:
                         flash = {"kind": "error", "message": describe_spotify_exception(exc)}
                     except Exception as exc:
@@ -977,22 +987,23 @@ def enqueue_background_job(path: str, form: dict[str, list[str]]):
         )
 
         def runner():
-            sp = get_spotify()
-            _, playlists = load_dashboard_context(sp)
-            flash = None
-            if op == "remove":
-                removal = remove_duplicates(sp, playlist_id, playlists)
-                flash = {"kind": "success", "message": removal["message"]}
-                invalidate_dashboard_cache()
-            return {
-                "sections": {
-                    "duplicates": {
-                        "playlist_id": playlist_id,
-                        "results": scan_duplicates(sp, playlist_id, playlists),
-                    }
-                },
-                "flash": flash,
-            }
+            with spotify_task_context("web.duplicates"):
+                sp = get_spotify()
+                _, playlists = load_dashboard_context(sp)
+                flash = None
+                if op == "remove":
+                    removal = remove_duplicates(sp, playlist_id, playlists)
+                    flash = {"kind": "success", "message": removal["message"]}
+                    invalidate_dashboard_cache()
+                return {
+                    "sections": {
+                        "duplicates": {
+                            "playlist_id": playlist_id,
+                            "results": scan_duplicates(sp, playlist_id, playlists),
+                        }
+                    },
+                    "flash": flash,
+                }
 
         job = BackgroundJob(
             id=uuid4().hex,
@@ -1009,17 +1020,18 @@ def enqueue_background_job(path: str, form: dict[str, list[str]]):
         cutoff_days = to_int(get_value(form, "cutoff_days", "30"), 30, minimum=1, maximum=3650)
 
         def runner():
-            sp = get_spotify()
-            _, playlists = load_dashboard_context(sp)
-            return {
-                "sections": {
-                    "never_played": {
-                        "playlist_id": playlist_id,
-                        "cutoff_days": cutoff_days,
-                        "report": scan_never_played(sp, playlist_id, cutoff_days, playlists),
+            with spotify_task_context("web.never_played"):
+                sp = get_spotify()
+                _, playlists = load_dashboard_context(sp)
+                return {
+                    "sections": {
+                        "never_played": {
+                            "playlist_id": playlist_id,
+                            "cutoff_days": cutoff_days,
+                            "report": scan_never_played(sp, playlist_id, cutoff_days, playlists),
+                        }
                     }
                 }
-            }
 
         job = BackgroundJob(
             id=uuid4().hex,
@@ -1037,16 +1049,17 @@ def enqueue_background_job(path: str, form: dict[str, list[str]]):
         op = get_value(form, "op", "scan")
 
         def runner():
-            sp = get_spotify()
-            _, playlists = load_dashboard_context(sp)
-            payload = {
-                "playlist_id": playlist_id,
-                "threshold": threshold,
-                "report": audit_playlist_sizes(sp, playlist_id, threshold, playlists),
-            }
-            if op == "preview":
-                payload["preview"] = build_smart_split_preview(sp, playlist_id, playlists)
-            return {"sections": {"size_audit": payload}}
+            with spotify_task_context("web.size_audit"):
+                sp = get_spotify()
+                _, playlists = load_dashboard_context(sp)
+                payload = {
+                    "playlist_id": playlist_id,
+                    "threshold": threshold,
+                    "report": audit_playlist_sizes(sp, playlist_id, threshold, playlists),
+                }
+                if op == "preview":
+                    payload["preview"] = build_smart_split_preview(sp, playlist_id, playlists)
+                return {"sections": {"size_audit": payload}}
 
         job = BackgroundJob(
             id=uuid4().hex,
@@ -1069,33 +1082,34 @@ def enqueue_background_job(path: str, form: dict[str, list[str]]):
         create_playlists = get_value(form, "create_playlists") == "yes"
 
         def runner():
-            sp = get_spotify()
-            result = organize_liked_web(
-                sp,
-                strategy=strategy,
-                prefix=prefix,
-                n_clusters=mood_clusters,
-                create_playlists=create_playlists,
-            )
-            flash = None
-            if create_playlists:
-                flash = {
-                    "kind": "success",
-                    "message": "Playlist organization finished. New playlists were created where groups had tracks.",
-                }
-                invalidate_dashboard_cache()
-            return {
-                "sections": {
-                    "organize": {
-                        "strategy": strategy,
-                        "prefix": prefix,
-                        "mood_clusters": mood_clusters,
-                        "create_playlists": create_playlists,
-                        "result": result,
+            with spotify_task_context("web.organize_liked"):
+                sp = get_spotify()
+                result = organize_liked_web(
+                    sp,
+                    strategy=strategy,
+                    prefix=prefix,
+                    n_clusters=mood_clusters,
+                    create_playlists=create_playlists,
+                )
+                flash = None
+                if create_playlists:
+                    flash = {
+                        "kind": "success",
+                        "message": "Playlist organization finished. New playlists were created where groups had tracks.",
                     }
-                },
-                "flash": flash,
-            }
+                    invalidate_dashboard_cache()
+                return {
+                    "sections": {
+                        "organize": {
+                            "strategy": strategy,
+                            "prefix": prefix,
+                            "mood_clusters": mood_clusters,
+                            "create_playlists": create_playlists,
+                            "result": result,
+                        }
+                    },
+                    "flash": flash,
+                }
 
         job = BackgroundJob(
             id=uuid4().hex,
@@ -1123,28 +1137,29 @@ def enqueue_background_job(path: str, form: dict[str, list[str]]):
         selected_track_id = get_value(form, "selected_track_id")
 
         def runner():
-            sp = get_spotify()
-            _, playlists = load_dashboard_context(sp)
-            result = run_discovery_web(
-                sp,
-                mode=state["mode"],
-                seed_track_id=selected_track_id,
-                playlist_id=state["playlist_id"],
-                n_results=state["n_results"],
-                save_playlist_name=state["save_playlist_name"],
-                playlists=playlists,
-            )
-            flash = None
-            if result.get("saved_to"):
-                flash = {
-                    "kind": "success",
-                    "message": f"Recommendations saved to '{result['saved_to']}'.",
+            with spotify_task_context("web.discovery.run"):
+                sp = get_spotify()
+                _, playlists = load_dashboard_context(sp)
+                result = run_discovery_web(
+                    sp,
+                    mode=state["mode"],
+                    seed_track_id=selected_track_id,
+                    playlist_id=state["playlist_id"],
+                    n_results=state["n_results"],
+                    save_playlist_name=state["save_playlist_name"],
+                    playlists=playlists,
+                )
+                flash = None
+                if result.get("saved_to"):
+                    flash = {
+                        "kind": "success",
+                        "message": f"Recommendations saved to '{result['saved_to']}'.",
+                    }
+                    invalidate_dashboard_cache()
+                return {
+                    "sections": {"discovery": {"state": state, "result": result}},
+                    "flash": flash,
                 }
-                invalidate_dashboard_cache()
-            return {
-                "sections": {"discovery": {"state": state, "result": result}},
-                "flash": flash,
-            }
 
         job = BackgroundJob(
             id=uuid4().hex,
@@ -1264,7 +1279,7 @@ def get_duplicate_source(
         return "Liked Songs", get_liked_tracks(sp), None
 
     playlist = require_playlist(playlists, source_id)
-    return playlist["name"], get_playlist_tracks(sp, playlist["id"]), playlist["id"]
+    return playlist["name"], get_playlist_tracks(sp, playlist["id"], playlist.get("snapshot_id")), playlist["id"]
 
 
 def scan_duplicates(sp: spotipy.Spotify, source_id: str, playlists: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1295,6 +1310,7 @@ def remove_duplicates(sp: spotipy.Spotify, source_id: str, playlists: list[dict[
         payload = build_duplicate_removal_payload(duplicates)
         for start in range(0, len(payload), 100):
             sp.playlist_remove_specific_occurrences_of_items(playlist_id, payload[start:start + 100])
+        invalidate_playlist_tracks_cache(playlist_id)
 
     removed = len(duplicates)
     return {"removed": removed, "message": f"Removed {removed} duplicate tracks from '{source_name}'."}
@@ -1312,7 +1328,7 @@ def scan_never_played(
     playlist = require_playlist(playlists, playlist_id)
 
     rows = []
-    for item in get_playlist_tracks(sp, playlist["id"]):
+    for item in get_playlist_tracks(sp, playlist["id"], playlist.get("snapshot_id")):
         track = item.get("track") or {}
         track_id = track.get("id")
         added_at = item.get("added_at")
@@ -1367,7 +1383,7 @@ def build_smart_split_preview(
 
     playlist = require_playlist(playlists, playlist_id)
 
-    tracks = get_playlist_tracks(sp, playlist_id)
+    tracks = get_playlist_tracks(sp, playlist_id, playlist.get("snapshot_id"))
     ids = [item["track"]["id"] for item in tracks if item.get("track") and item["track"].get("id")]
     feature_rows = _batch_audio_features_with_ids(sp, ids)
     features = [features for _, features in feature_rows]
@@ -1601,7 +1617,7 @@ def run_discovery_web(
         if not playlist:
             raise ValueError("That playlist was not found in your library.")
         playlist_name = playlist["name"]
-        playlist_features = average_playlist_profile(sp, playlist_id)
+        playlist_features = average_playlist_profile(sp, playlist_id, playlist.get("snapshot_id"))
 
     if do_song and do_playlist and seed_features and playlist_features:
         target_features = {}
@@ -1708,8 +1724,8 @@ def run_discovery_web(
     }
 
 
-def average_playlist_profile(sp: spotipy.Spotify, playlist_id: str) -> dict[str, float]:
-    tracks = get_playlist_tracks(sp, playlist_id)
+def average_playlist_profile(sp: spotipy.Spotify, playlist_id: str, snapshot_id: str | None = None) -> dict[str, float]:
+    tracks = get_playlist_tracks(sp, playlist_id, snapshot_id)
     ids = [item["track"]["id"] for item in tracks if item.get("track") and item["track"].get("id")]
     features = _batch_audio_features(sp, ids)
     if not features:

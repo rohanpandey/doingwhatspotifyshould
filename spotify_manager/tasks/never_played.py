@@ -27,7 +27,7 @@ def task_never_played(sp: spotipy.Spotify, dry_run: bool):
 
     for pl in playlists:
         pl_name = pl["name"]
-        tracks  = get_playlist_tracks(sp, pl["id"])
+        tracks  = get_playlist_tracks(sp, pl["id"], pl.get("snapshot_id"))
         stale   = []
 
         for item in tracks:

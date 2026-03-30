@@ -5,10 +5,14 @@ spotify_client.py — Shared Spotify API throttling, cooldown, and caching.
 from __future__ import annotations
 
 import copy
+import json
 import math
 import threading
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 import spotipy
@@ -28,20 +32,20 @@ class CacheEntry:
 
 
 CACHE_POLICIES: dict[str, CachePolicy] = {
-    "current_user": CachePolicy(ttl_seconds=6 * 60 * 60, stale_seconds=24 * 60 * 60),
-    "current_user_playlists": CachePolicy(ttl_seconds=30 * 60, stale_seconds=6 * 60 * 60),
-    "playlist_items": CachePolicy(ttl_seconds=30 * 60, stale_seconds=6 * 60 * 60),
-    "current_user_saved_tracks": CachePolicy(ttl_seconds=30 * 60, stale_seconds=6 * 60 * 60),
-    "current_user_recently_played": CachePolicy(ttl_seconds=2 * 60, stale_seconds=10 * 60),
-    "current_user_top_tracks": CachePolicy(ttl_seconds=60 * 60, stale_seconds=6 * 60 * 60),
-    "current_user_top_artists": CachePolicy(ttl_seconds=60 * 60, stale_seconds=6 * 60 * 60),
-    "audio_features": CachePolicy(ttl_seconds=24 * 60 * 60, stale_seconds=7 * 24 * 60 * 60),
-    "artists": CachePolicy(ttl_seconds=12 * 60 * 60, stale_seconds=3 * 24 * 60 * 60),
-    "artist_related_artists": CachePolicy(ttl_seconds=12 * 60 * 60, stale_seconds=3 * 24 * 60 * 60),
-    "artist_top_tracks": CachePolicy(ttl_seconds=12 * 60 * 60, stale_seconds=3 * 24 * 60 * 60),
-    "track": CachePolicy(ttl_seconds=24 * 60 * 60, stale_seconds=7 * 24 * 60 * 60),
-    "search": CachePolicy(ttl_seconds=10 * 60, stale_seconds=60 * 60),
-    "recommendations": CachePolicy(ttl_seconds=10 * 60, stale_seconds=60 * 60),
+    "current_user": CachePolicy(ttl_seconds=12 * 60 * 60, stale_seconds=7 * 24 * 60 * 60),
+    "current_user_playlists": CachePolicy(ttl_seconds=20 * 60, stale_seconds=8 * 60 * 60),
+    "playlist_items": CachePolicy(ttl_seconds=20 * 60, stale_seconds=8 * 60 * 60),
+    "current_user_saved_tracks": CachePolicy(ttl_seconds=20 * 60, stale_seconds=8 * 60 * 60),
+    "current_user_recently_played": CachePolicy(ttl_seconds=45, stale_seconds=10 * 60),
+    "current_user_top_tracks": CachePolicy(ttl_seconds=3 * 60 * 60, stale_seconds=24 * 60 * 60),
+    "current_user_top_artists": CachePolicy(ttl_seconds=3 * 60 * 60, stale_seconds=24 * 60 * 60),
+    "audio_features": CachePolicy(ttl_seconds=3 * 24 * 60 * 60, stale_seconds=14 * 24 * 60 * 60),
+    "artists": CachePolicy(ttl_seconds=24 * 60 * 60, stale_seconds=14 * 24 * 60 * 60),
+    "artist_related_artists": CachePolicy(ttl_seconds=12 * 60 * 60, stale_seconds=7 * 24 * 60 * 60),
+    "artist_top_tracks": CachePolicy(ttl_seconds=12 * 60 * 60, stale_seconds=7 * 24 * 60 * 60),
+    "track": CachePolicy(ttl_seconds=24 * 60 * 60, stale_seconds=14 * 24 * 60 * 60),
+    "search": CachePolicy(ttl_seconds=90, stale_seconds=30 * 60),
+    "recommendations": CachePolicy(ttl_seconds=2 * 60, stale_seconds=20 * 60),
 }
 
 WRITE_METHODS = {
@@ -52,6 +56,8 @@ WRITE_METHODS = {
     "playlist_remove_specific_occurrences_of_items",
     "user_playlist_create",
 }
+LOG_PATH = Path(__file__).resolve().parents[2] / "spotify_api_log.jsonl"
+_TASK_CONTEXT: ContextVar[str] = ContextVar("spotify_task_context", default="unspecified")
 
 
 def _freeze(value: Any) -> Any:
@@ -76,6 +82,7 @@ class SpotifyApiController:
         self._cooldown_until = 0.0
         self._cooldown_message = ""
         self._min_interval_seconds = 0.14
+        self._log_lock = threading.RLock()
 
     def _clone(self, value: Any) -> Any:
         return copy.deepcopy(value)
@@ -134,6 +141,39 @@ class SpotifyApiController:
             for key in doomed:
                 self._cache.pop(key, None)
 
+    def _endpoint_name(self, method_name: str, args: tuple[Any, ...]) -> str:
+        if method_name in {"_delete", "_put", "_post", "_get"} and args:
+            return f"{method_name}:{args[0]}"
+        if method_name in {"playlist_add_items", "playlist_remove_specific_occurrences_of_items"} and args:
+            return f"{method_name}:{args[0]}"
+        return method_name
+
+    def _log_event(
+        self,
+        *,
+        task: str,
+        method_name: str,
+        args: tuple[Any, ...],
+        duration_ms: int,
+        outcome: str,
+        cache_state: str,
+        http_status: int | None = None,
+    ):
+        entry = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "task": task,
+            "endpoint": self._endpoint_name(method_name, args),
+            "duration_ms": duration_ms,
+            "outcome": outcome,
+            "cache": cache_state,
+        }
+        if http_status is not None:
+            entry["http_status"] = http_status
+        line = json.dumps(entry, sort_keys=True)
+        with self._log_lock:
+            with LOG_PATH.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+
     def invalidate_after_write(self, method_name: str, args: tuple[Any, ...], kwargs: dict[str, Any]):
         methods_to_clear: set[str] = set()
         if method_name in {"playlist_add_items", "playlist_remove_specific_occurrences_of_items", "user_playlist_create"}:
@@ -165,22 +205,92 @@ class SpotifyApiController:
         cache_key = _build_cache_key(method_name, args, kwargs) if policy else None
         cached = self._get_cache_entry(cache_key)
         now = time.time()
+        task = _TASK_CONTEXT.get()
 
         if cached and now < cached.expires_at:
+            self._log_event(
+                task=task,
+                method_name=method_name,
+                args=args,
+                duration_ms=0,
+                outcome="ok",
+                cache_state="fresh_hit",
+                http_status=200,
+            )
             return self._clone(cached.value)
         if cached and self.get_rate_limit_status()["cooldown_active"] and now < cached.stale_at:
+            self._log_event(
+                task=task,
+                method_name=method_name,
+                args=args,
+                duration_ms=0,
+                outcome="ok",
+                cache_state="stale_hit",
+                http_status=200,
+            )
             return self._clone(cached.value)
 
-        self._respect_cooldown()
+        try:
+            self._respect_cooldown()
+        except spotipy.SpotifyException as exc:
+            self._log_event(
+                task=task,
+                method_name=method_name,
+                args=args,
+                duration_ms=0,
+                outcome="cooldown_block",
+                cache_state="miss",
+                http_status=exc.http_status,
+            )
+            raise
         self._reserve_request_slot()
+        started_at = time.time()
 
         try:
             result = target(*args, **kwargs)
         except spotipy.SpotifyException as exc:
             self._note_exception(exc)
+            self._log_event(
+                task=task,
+                method_name=method_name,
+                args=args,
+                duration_ms=int((time.time() - started_at) * 1000),
+                outcome="spotify_error",
+                cache_state="miss",
+                http_status=exc.http_status,
+            )
             if cached and exc.http_status in {429, 500, 502, 503, 504} and time.time() < cached.stale_at:
+                self._log_event(
+                    task=task,
+                    method_name=method_name,
+                    args=args,
+                    duration_ms=0,
+                    outcome="ok",
+                    cache_state="stale_fallback",
+                    http_status=200,
+                )
                 return self._clone(cached.value)
             raise
+        except Exception:
+            self._log_event(
+                task=task,
+                method_name=method_name,
+                args=args,
+                duration_ms=int((time.time() - started_at) * 1000),
+                outcome="error",
+                cache_state="miss",
+            )
+            raise
+
+        self._log_event(
+            task=task,
+            method_name=method_name,
+            args=args,
+            duration_ms=int((time.time() - started_at) * 1000),
+            outcome="ok",
+            cache_state="miss",
+            http_status=200,
+        )
 
         if method_name in WRITE_METHODS:
             self.invalidate_after_write(method_name, args, kwargs)
@@ -218,3 +328,12 @@ class SpotifyClientProxy:
 
 def wrap_spotify_client(client: spotipy.Spotify) -> SpotifyClientProxy:
     return SpotifyClientProxy(client)
+
+
+@contextmanager
+def spotify_task_context(task_name: str):
+    token = _TASK_CONTEXT.set(task_name)
+    try:
+        yield
+    finally:
+        _TASK_CONTEXT.reset(token)

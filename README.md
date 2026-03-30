@@ -88,8 +88,10 @@ The app now also ships with a shared Spotify client wrapper that:
 
 - spaces requests out slightly instead of firing them back-to-back
 - caches stable reads like profile data, playlist pages, liked-song pages, artist lookups, and audio features for longer
+- skips rebuilding normalized playlist scans when Spotify reports the same `snapshot_id` for a playlist
 - remembers Spotify `429` cooldown windows and reuses cached data where it safely can
 - serializes web jobs so the browser UI does not kick off overlapping Spotify-heavy scans
+- writes lightweight endpoint/task request logs to `spotify_api_log.jsonl` so you can spot hot paths later
 
 In the browser UI:
 
@@ -202,6 +204,7 @@ Tracks are marked "seen" with a timestamp rather than permanently excluded. Afte
 |------|---------|
 | `taste_model.json` | Cluster centroids, bandit state, feature weights, loved vectors, exclusion sets |
 | `session_log.jsonl` | Full append-only history of every shown/rated track |
+| `spotify_api_log.jsonl` | Lightweight Spotify endpoint/task request log for rate-limit debugging |
 | `.spotify_token_cache` | OAuth token (auto-refreshed) |
 
 ---

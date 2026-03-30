@@ -249,7 +249,7 @@ def _pick_playlist_profile(sp: spotipy.Spotify) -> dict:
         return {}
 
     console.print(f"  → Computing energy profile for: [bold]{pl['name']}[/bold]…")
-    tracks   = get_playlist_tracks(sp, pl["id"])
+    tracks   = get_playlist_tracks(sp, pl["id"], pl.get("snapshot_id"))
     ids      = [t["track"]["id"] for t in tracks]
     features = _batch_audio_features(sp, ids)
     if not features:
