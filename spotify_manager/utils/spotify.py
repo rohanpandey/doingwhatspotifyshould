@@ -65,10 +65,10 @@ def get_liked_tracks(sp: spotipy.Spotify):
 
 
 def remove_liked_tracks(sp: spotipy.Spotify, track_ids: list[str]):
-    """Remove saved tracks in Spotify's supported 50-ID batches."""
-    for start in range(0, len(track_ids), 50):
-        chunk = [track_id for track_id in track_ids[start:start + 50] if track_id]
+    """Remove saved tracks via the current library endpoint in 40-URI batches."""
+    for start in range(0, len(track_ids), 40):
+        chunk = [f"spotify:track:{track_id}" for track_id in track_ids[start:start + 40] if track_id]
         if not chunk:
             continue
-        sp._delete("me/tracks", ids=",".join(chunk))
+        sp._delete("me/library", uris=",".join(chunk))
         time.sleep(0.05)

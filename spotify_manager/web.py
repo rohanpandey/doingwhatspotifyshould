@@ -37,6 +37,12 @@ DISCOVERY_FEATURE_KEYS = [
 ]
 GENRE_OTHER = "Other / Mixed"
 LIKED_SONGS_SOURCE_ID = "__liked_songs__"
+DASHBOARD_CACHE_TTL_SECONDS = 15
+_dashboard_cache: dict[str, Any] = {
+    "overview": None,
+    "playlists": None,
+    "expires_at": 0.0,
+}
 
 APP_STYLES = """
 :root {
@@ -666,11 +672,11 @@ def build_app():
                         playlist_id = get_value(form, "playlist_id")
                         op = get_value(form, "op", "scan")
                         if op == "remove":
-                            removal = remove_duplicates(sp, playlist_id)
+                            removal = remove_duplicates(sp, playlist_id, playlists)
                             flash = {"kind": "success", "message": removal["message"]}
                         sections["duplicates"] = {
                             "playlist_id": playlist_id,
-                            "results": scan_duplicates(sp, playlist_id),
+                            "results": scan_duplicates(sp, playlist_id, playlists),
                         }
                     elif path == "/never-played":
                         active_section = "never-played"
@@ -679,7 +685,7 @@ def build_app():
                         sections["never_played"] = {
                             "playlist_id": playlist_id,
                             "cutoff_days": days,
-                            "report": scan_never_played(sp, playlist_id, days),
+                            "report": scan_never_played(sp, playlist_id, days, playlists),
                         }
                     elif path == "/size-audit":
                         active_section = "size-audit"
@@ -689,10 +695,10 @@ def build_app():
                         sections["size_audit"] = {
                             "playlist_id": playlist_id,
                             "threshold": threshold,
-                            "report": audit_playlist_sizes(sp, playlist_id, threshold),
+                            "report": audit_playlist_sizes(sp, playlist_id, threshold, playlists),
                         }
                         if op == "preview":
-                            sections["size_audit"]["preview"] = build_smart_split_preview(sp, playlist_id)
+                            sections["size_audit"]["preview"] = build_smart_split_preview(sp, playlist_id, playlists)
                     elif path == "/organize-liked":
                         active_section = "organize-liked"
                         strategy = get_value(form, "strategy", "both")
@@ -741,12 +747,15 @@ def build_app():
                                 playlist_id=state["playlist_id"],
                                 n_results=state["n_results"],
                                 save_playlist_name=state["save_playlist_name"],
+                                playlists=playlists,
                             )
                             if sections["discovery"]["result"].get("saved_to"):
                                 flash = {
                                     "kind": "success",
                                     "message": f"Recommendations saved to '{sections['discovery']['result']['saved_to']}'.",
                                 }
+                except spotipy.SpotifyException as exc:
+                    flash = {"kind": "error", "message": describe_spotify_exception(exc)}
                 except Exception as exc:
                     flash = {"kind": "error", "message": str(exc)}
 
@@ -754,6 +763,9 @@ def build_app():
         except SystemExit as exc:  # pragma: no cover - auth helper exits on missing credentials
             status = "500 Internal Server Error"
             html = render_error_page(RuntimeError(f"Spotify credentials are missing or invalid (exit code {exc.code})."))
+        except spotipy.SpotifyException as exc:  # pragma: no cover - best effort browser diagnostics
+            status = "429 Too Many Requests" if exc.http_status == 429 else "500 Internal Server Error"
+            html = render_error_page(RuntimeError(describe_spotify_exception(exc)))
         except Exception as exc:  # pragma: no cover - best effort browser diagnostics
             status = "500 Internal Server Error"
             html = render_error_page(exc)
@@ -796,12 +808,59 @@ def to_int(value: str, default: int, minimum: int | None = None, maximum: int | 
     return parsed
 
 
+def format_wait_time(seconds: int | None) -> str:
+    if seconds is None or seconds <= 0:
+        return "a little while"
+    if seconds < 60:
+        return f"{seconds} second{'s' if seconds != 1 else ''}"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        if minutes:
+            return f"{hours} hour{'s' if hours != 1 else ''} {minutes} minute{'s' if minutes != 1 else ''}"
+        return f"{hours} hour{'s' if hours != 1 else ''}"
+    days, hours = divmod(hours, 24)
+    if hours:
+        return f"{days} day{'s' if days != 1 else ''} {hours} hour{'s' if hours != 1 else ''}"
+    return f"{days} day{'s' if days != 1 else ''}"
+
+
+def describe_spotify_exception(exc: spotipy.SpotifyException) -> str:
+    if exc.http_status == 429:
+        retry_after = None
+        if exc.headers:
+            try:
+                retry_after = int(exc.headers.get("Retry-After", "0") or "0")
+            except (TypeError, ValueError):
+                retry_after = None
+        return (
+            "Spotify asked us to slow down. "
+            f"Please try again in about {format_wait_time(retry_after)}."
+        )
+    if exc.http_status in {401, 403}:
+        return "Spotify rejected this request. Re-authenticate and try again."
+    return str(exc)
+
+
 def load_dashboard_context(sp: spotipy.Spotify) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    me = sp.current_user()
-    playlists = sorted(get_all_playlists(sp), key=lambda item: item["name"].lower())
-    saved = sp.current_user_saved_tracks(limit=1)
-    recent = sp.current_user_recently_played(limit=10)
-    model = TasteModel.load()
+    now = time.time()
+    cached_overview = _dashboard_cache.get("overview")
+    cached_playlists = _dashboard_cache.get("playlists")
+    if cached_overview and cached_playlists and now < float(_dashboard_cache.get("expires_at", 0.0)):
+        return cached_overview, cached_playlists
+
+    try:
+        me = sp.current_user()
+        playlists = sorted(get_all_playlists(sp), key=lambda item: item["name"].lower())
+        saved = sp.current_user_saved_tracks(limit=1)
+        recent = sp.current_user_recently_played(limit=10)
+        model = TasteModel.load()
+    except spotipy.SpotifyException:
+        if cached_overview and cached_playlists:
+            return cached_overview, cached_playlists
+        raise
 
     overview = {
         "user_name": me.get("display_name") or me.get("id") or "Spotify user",
@@ -813,6 +872,9 @@ def load_dashboard_context(sp: spotipy.Spotify) -> tuple[dict[str, Any], list[di
         "taste_model_ready": bool(model.clusters),
         "taste_sessions": model.session_count,
     }
+    _dashboard_cache["overview"] = overview
+    _dashboard_cache["playlists"] = playlists
+    _dashboard_cache["expires_at"] = now + DASHBOARD_CACHE_TTL_SECONDS
     return overview, playlists
 
 
@@ -825,16 +887,20 @@ def require_playlist(playlists: list[dict[str, Any]], playlist_id: str) -> dict[
     return playlist
 
 
-def get_duplicate_source(sp: spotipy.Spotify, source_id: str) -> tuple[str, list[dict[str, Any]], str | None]:
+def get_duplicate_source(
+    sp: spotipy.Spotify,
+    source_id: str,
+    playlists: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]], str | None]:
     if source_id == LIKED_SONGS_SOURCE_ID:
         return "Liked Songs", get_liked_tracks(sp), None
 
-    playlist = require_playlist(get_all_playlists(sp), source_id)
+    playlist = require_playlist(playlists, source_id)
     return playlist["name"], get_playlist_tracks(sp, playlist["id"]), playlist["id"]
 
 
-def scan_duplicates(sp: spotipy.Spotify, source_id: str) -> list[dict[str, Any]]:
-    source_name, tracks, playlist_id = get_duplicate_source(sp, source_id)
+def scan_duplicates(sp: spotipy.Spotify, source_id: str, playlists: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    source_name, tracks, playlist_id = get_duplicate_source(sp, source_id, playlists)
     results = []
     duplicates = find_duplicate_entries(tracks)
     if duplicates:
@@ -848,8 +914,8 @@ def scan_duplicates(sp: spotipy.Spotify, source_id: str) -> list[dict[str, Any]]
     return results
 
 
-def remove_duplicates(sp: spotipy.Spotify, source_id: str) -> dict[str, Any]:
-    source_name, tracks, playlist_id = get_duplicate_source(sp, source_id)
+def remove_duplicates(sp: spotipy.Spotify, source_id: str, playlists: list[dict[str, Any]]) -> dict[str, Any]:
+    source_name, tracks, playlist_id = get_duplicate_source(sp, source_id, playlists)
     duplicates = find_duplicate_entries(tracks)
     if not duplicates:
         return {"removed": 0, "message": f"'{source_name}' is already clean."}
@@ -866,11 +932,16 @@ def remove_duplicates(sp: spotipy.Spotify, source_id: str) -> dict[str, Any]:
     return {"removed": removed, "message": f"Removed {removed} duplicate tracks from '{source_name}'."}
 
 
-def scan_never_played(sp: spotipy.Spotify, playlist_id: str, cutoff_days: int) -> dict[str, Any]:
+def scan_never_played(
+    sp: spotipy.Spotify,
+    playlist_id: str,
+    cutoff_days: int,
+    playlists: list[dict[str, Any]],
+) -> dict[str, Any]:
     recent = sp.current_user_recently_played(limit=50)
     played_ids = {item["track"]["id"] for item in recent.get("items", []) if item.get("track")}
     cutoff = datetime.datetime.utcnow() - datetime.timedelta(days=cutoff_days)
-    playlist = require_playlist(get_all_playlists(sp), playlist_id)
+    playlist = require_playlist(playlists, playlist_id)
 
     rows = []
     for item in get_playlist_tracks(sp, playlist["id"]):
@@ -900,8 +971,13 @@ def scan_never_played(sp: spotipy.Spotify, playlist_id: str, cutoff_days: int) -
     }
 
 
-def audit_playlist_sizes(sp: spotipy.Spotify, playlist_id: str, threshold: int) -> list[dict[str, Any]]:
-    playlist = require_playlist(get_all_playlists(sp), playlist_id)
+def audit_playlist_sizes(
+    sp: spotipy.Spotify,
+    playlist_id: str,
+    threshold: int,
+    playlists: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    playlist = require_playlist(playlists, playlist_id)
     count = (playlist.get("tracks") or {}).get("total", 0)
     if count <= threshold:
         return []
@@ -913,11 +989,15 @@ def audit_playlist_sizes(sp: spotipy.Spotify, playlist_id: str, threshold: int) 
     }]
 
 
-def build_smart_split_preview(sp: spotipy.Spotify, playlist_id: str) -> dict[str, Any]:
+def build_smart_split_preview(
+    sp: spotipy.Spotify,
+    playlist_id: str,
+    playlists: list[dict[str, Any]],
+) -> dict[str, Any]:
     if not HAS_ML:
         raise ValueError("Smart split preview needs numpy and scikit-learn installed.")
 
-    playlist = require_playlist(get_all_playlists(sp), playlist_id)
+    playlist = require_playlist(playlists, playlist_id)
 
     tracks = get_playlist_tracks(sp, playlist_id)
     ids = [item["track"]["id"] for item in tracks if item.get("track") and item["track"].get("id")]
@@ -1123,6 +1203,7 @@ def run_discovery_web(
     playlist_id: str,
     n_results: int,
     save_playlist_name: str,
+    playlists: list[dict[str, Any]],
 ) -> dict[str, Any]:
     do_song = mode in {"song", "both"}
     do_playlist = mode in {"playlist", "both"}
@@ -1148,7 +1229,7 @@ def run_discovery_web(
     if do_playlist:
         if not playlist_id:
             raise ValueError("Choose a playlist when using playlist-based discovery.")
-        playlist = next((item for item in get_all_playlists(sp) if item["id"] == playlist_id), None)
+        playlist = next((item for item in playlists if item["id"] == playlist_id), None)
         if not playlist:
             raise ValueError("That playlist was not found in your library.")
         playlist_name = playlist["name"]

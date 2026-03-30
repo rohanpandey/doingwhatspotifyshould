@@ -53,4 +53,8 @@ def get_spotify() -> spotipy.Spotify:
         cache_path=".spotify_token_cache",
         open_browser=True,
     )
-    return spotipy.Spotify(auth_manager=auth, requests_timeout=15)
+    return spotipy.Spotify(
+        auth_manager=auth,
+        requests_timeout=15,
+        status_retries=0,
+    )
