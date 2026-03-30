@@ -20,7 +20,7 @@ A personal Spotify toolkit with both a CLI and a local web UI for playlist clean
 ## Interfaces
 
 - **Web UI** — `python -m spotify_manager --web`
-  Tasks 1–5 are available in the browser. Tasks 1–3 operate on a selected playlist from a dropdown, and long-running actions show an in-page loading/progress overlay.
+  Tasks 1–5 are available in the browser. Tasks 1–3 operate on a selected playlist from a dropdown. Spotify-heavy actions now run through a single background worker so only one large scan runs at a time, and the page auto-refreshes with in-progress status while that job finishes.
 - **CLI** — `python -m spotify_manager ...`
   All six tasks are available here, including the full interactive Taste Engine session.
 
@@ -84,6 +84,13 @@ On first run, a browser window will open for Spotify OAuth. The token is cached 
 
 When running `--web`, the app starts a local server at `http://127.0.0.1:8000` by default. You can change that with `--host` and `--port`.
 
+The app now also ships with a shared Spotify client wrapper that:
+
+- spaces requests out slightly instead of firing them back-to-back
+- caches stable reads like profile data, playlist pages, liked-song pages, artist lookups, and audio features for longer
+- remembers Spotify `429` cooldown windows and reuses cached data where it safely can
+- serializes web jobs so the browser UI does not kick off overlapping Spotify-heavy scans
+
 In the browser UI:
 
 - Task 1 scans one selected playlist for duplicate songs
@@ -91,6 +98,7 @@ In the browser UI:
 - Task 3 audits one selected playlist against a size threshold and can preview a smart split
 - Task 4 organizes your liked songs
 - Task 5 runs one-shot discovery
+- When a heavy job is running, the page shows the active job state and temporarily locks the other Spotify write/scan actions until it completes
 
 ---
 
@@ -211,7 +219,8 @@ spotify-manager/
 │   │   ├── display.py        # Rich/plain-text console helpers
 │   │   ├── audio.py          # Audio feature helpers + k-means clustering
 │   │   ├── duplicates.py     # Semantic duplicate matching helpers
-│   │   └── spotify.py        # Pagination and library helpers
+│   │   ├── spotify.py        # Pagination and library helpers
+│   │   └── spotify_client.py # Shared Spotify throttling, cooldowns, and caching
 │   ├── models/
 │   │   └── taste_model.py    # TasteModel class + session log functions
 │   └── tasks/

@@ -10,6 +10,7 @@ import spotipy
 from spotipy.oauth2 import SpotifyOAuth
 
 from .utils.display import console
+from .utils.spotify_client import wrap_spotify_client
 
 SCOPES = " ".join([
     "playlist-read-private",
@@ -53,8 +54,9 @@ def get_spotify() -> spotipy.Spotify:
         cache_path=".spotify_token_cache",
         open_browser=True,
     )
-    return spotipy.Spotify(
+    client = spotipy.Spotify(
         auth_manager=auth,
         requests_timeout=15,
         status_retries=0,
     )
+    return wrap_spotify_client(client)

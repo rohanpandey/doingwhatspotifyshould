@@ -9,12 +9,16 @@ from __future__ import annotations
 
 import datetime
 import math
+import queue
+import threading
 import time
 from collections import defaultdict
+from dataclasses import dataclass, field
 from html import escape
 from typing import Any
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlencode
 from wsgiref.simple_server import make_server
+from uuid import uuid4
 
 import spotipy
 
@@ -43,6 +47,99 @@ _dashboard_cache: dict[str, Any] = {
     "playlists": None,
     "expires_at": 0.0,
 }
+JOB_POLL_INTERVAL_MS = 2000
+
+
+@dataclass
+class BackgroundJob:
+    id: str
+    section_key: str
+    section_anchor: str
+    title: str
+    detail: str
+    form_state: dict[str, Any] = field(default_factory=dict)
+    status: str = "queued"
+    created_at: float = field(default_factory=time.time)
+    started_at: float | None = None
+    finished_at: float | None = None
+    sections: dict[str, Any] = field(default_factory=dict)
+    flash: dict[str, str] | None = None
+    error: Exception | None = None
+
+    @property
+    def is_active(self) -> bool:
+        return self.status in {"queued", "running"}
+
+
+class JobManager:
+    def __init__(self):
+        self._jobs: dict[str, BackgroundJob] = {}
+        self._active_job_id: str | None = None
+        self._queue: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self._lock = threading.RLock()
+        self._worker = threading.Thread(target=self._run_forever, daemon=True)
+        self._worker.start()
+
+    def get(self, job_id: str | None) -> BackgroundJob | None:
+        if not job_id:
+            return None
+        with self._lock:
+            return self._jobs.get(job_id)
+
+    def get_active(self) -> BackgroundJob | None:
+        with self._lock:
+            if not self._active_job_id:
+                return None
+            job = self._jobs.get(self._active_job_id)
+            if job and job.is_active:
+                return job
+            return None
+
+    def enqueue(self, job: BackgroundJob, runner):
+        with self._lock:
+            active = self.get_active()
+            if active:
+                return None, active
+            self._jobs[job.id] = job
+            self._active_job_id = job.id
+        self._queue.put((job.id, runner))
+        return job, None
+
+    def _run_forever(self):
+        while True:
+            job_id, runner = self._queue.get()
+            with self._lock:
+                job = self._jobs.get(job_id)
+                if not job:
+                    self._queue.task_done()
+                    continue
+                job.status = "running"
+                job.started_at = time.time()
+            try:
+                payload = runner()
+            except Exception as exc:  # pragma: no cover - background failure path
+                with self._lock:
+                    job = self._jobs.get(job_id)
+                    if job:
+                        job.status = "failed"
+                        job.finished_at = time.time()
+                        job.error = exc
+            else:
+                with self._lock:
+                    job = self._jobs.get(job_id)
+                    if job:
+                        job.status = "completed"
+                        job.finished_at = time.time()
+                        job.sections = payload.get("sections", {})
+                        job.flash = payload.get("flash")
+            finally:
+                with self._lock:
+                    if self._active_job_id == job_id:
+                        self._active_job_id = None
+                self._queue.task_done()
+
+
+_job_manager = JobManager()
 
 APP_STYLES = """
 :root {
@@ -196,6 +293,43 @@ body.is-loading {
 .flash.error {
   background: rgba(180, 35, 24, 0.10);
   color: #7a1d17;
+}
+
+.job-banner {
+  margin-top: 22px;
+  padding: 18px 20px;
+  border-radius: var(--radius-lg);
+  border: 1px solid rgba(255, 255, 255, 0.72);
+  background: rgba(255, 247, 237, 0.9);
+  box-shadow: var(--shadow);
+}
+
+.job-banner strong {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 1.05rem;
+}
+
+.job-banner.running {
+  border-color: rgba(31, 111, 120, 0.28);
+}
+
+.job-banner.failed {
+  border-color: rgba(180, 35, 24, 0.24);
+}
+
+.job-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 12px;
+  color: var(--muted);
+  font-size: 0.94rem;
+}
+
+.job-help {
+  margin-top: 10px;
+  color: var(--muted);
 }
 
 .loading-overlay {
@@ -561,6 +695,10 @@ summary {
 
 APP_SCRIPT = """
 (() => {
+  const body = document.body;
+  const pollUrl = body.dataset.jobPollUrl;
+  const pollMs = Number(body.dataset.jobPollMs || "0");
+  const jobActive = body.dataset.jobActive === "true";
   const overlay = document.querySelector("[data-loading-overlay]");
   if (!overlay) return;
 
@@ -613,6 +751,10 @@ APP_SCRIPT = """
     const form = event.target;
     if (!(form instanceof HTMLFormElement)) return;
     if ((form.method || "").toLowerCase() !== "post") return;
+    if (jobActive) {
+      event.preventDefault();
+      return;
+    }
 
     const submitter = event.submitter;
     const message =
@@ -635,6 +777,17 @@ APP_SCRIPT = """
     stopTicker();
     document.body.classList.remove("is-loading");
   });
+
+  if (jobActive) {
+    document.querySelectorAll("form[method='post'] button, form[method='post'] input[type='submit']").forEach((element) => {
+      element.disabled = true;
+    });
+    if (pollUrl && pollMs > 0) {
+      window.setTimeout(() => {
+        window.location.href = pollUrl + window.location.hash;
+      }, pollMs);
+    }
+  }
 })();
 """
 
@@ -653,113 +806,83 @@ def run_web_app(host: str = "127.0.0.1", port: int = 8000):
 
 def build_app():
     def app(environ, start_response):
-        status = "200 OK"
+        method = environ.get("REQUEST_METHOD", "GET").upper()
+        path = environ.get("PATH_INFO", "/")
+        query = parse_query(environ)
+        job_id = get_value(query, "job_id")
+        form: dict[str, list[str]] | None = None
+
         try:
+            if method == "POST":
+                form = parse_form(environ)
+                if should_enqueue_job(path, form):
+                    job, active = enqueue_background_job(path, form)
+                    location = build_job_location(
+                        (job or active).id,
+                        (job or active).section_anchor,
+                        busy=bool(active and not job),
+                    )
+                    return redirect(start_response, location)
+
             sp = get_spotify()
             overview, playlists = load_dashboard_context(sp)
             active_section = None
             flash = None
             sections: dict[str, Any] = {}
 
-            method = environ.get("REQUEST_METHOD", "GET").upper()
-            path = environ.get("PATH_INFO", "/")
+            requested_job = _job_manager.get(job_id)
+            active_job = _job_manager.get_active()
 
-            if method == "POST":
-                form = parse_form(environ)
-                try:
-                    if path == "/duplicates":
-                        active_section = "duplicates"
-                        playlist_id = get_value(form, "playlist_id")
-                        op = get_value(form, "op", "scan")
-                        if op == "remove":
-                            removal = remove_duplicates(sp, playlist_id, playlists)
-                            flash = {"kind": "success", "message": removal["message"]}
-                        sections["duplicates"] = {
-                            "playlist_id": playlist_id,
-                            "results": scan_duplicates(sp, playlist_id, playlists),
-                        }
-                    elif path == "/never-played":
-                        active_section = "never-played"
-                        playlist_id = get_value(form, "playlist_id")
-                        days = to_int(get_value(form, "cutoff_days", "30"), 30, minimum=1, maximum=3650)
-                        sections["never_played"] = {
-                            "playlist_id": playlist_id,
-                            "cutoff_days": days,
-                            "report": scan_never_played(sp, playlist_id, days, playlists),
-                        }
-                    elif path == "/size-audit":
-                        active_section = "size-audit"
-                        playlist_id = get_value(form, "playlist_id")
-                        threshold = to_int(get_value(form, "threshold", "80"), 80, minimum=1, maximum=10000)
-                        op = get_value(form, "op", "scan")
-                        sections["size_audit"] = {
-                            "playlist_id": playlist_id,
-                            "threshold": threshold,
-                            "report": audit_playlist_sizes(sp, playlist_id, threshold, playlists),
-                        }
-                        if op == "preview":
-                            sections["size_audit"]["preview"] = build_smart_split_preview(sp, playlist_id, playlists)
-                    elif path == "/organize-liked":
-                        active_section = "organize-liked"
-                        strategy = get_value(form, "strategy", "both")
-                        prefix = get_value(form, "prefix", "Liked Songs")
-                        mood_clusters = to_int(get_value(form, "mood_clusters", "4"), 4, minimum=2, maximum=8)
-                        create_playlists = get_value(form, "create_playlists") == "yes"
-                        sections["organize"] = {
-                            "strategy": strategy,
-                            "prefix": prefix,
-                            "mood_clusters": mood_clusters,
-                            "create_playlists": create_playlists,
-                            "result": organize_liked_web(
-                                sp,
-                                strategy=strategy,
-                                prefix=prefix,
-                                n_clusters=mood_clusters,
-                                create_playlists=create_playlists,
-                            ),
-                        }
-                        if create_playlists:
-                            flash = {
-                                "kind": "success",
-                                "message": "Playlist organization finished. New playlists were created where groups had tracks.",
-                            }
-                    elif path == "/discovery":
-                        active_section = "discovery"
-                        op = get_value(form, "op", "search")
-                        state = {
-                            "mode": get_value(form, "mode", "song"),
-                            "song_query": get_value(form, "song_query"),
-                            "playlist_id": get_value(form, "playlist_id"),
-                            "n_results": to_int(get_value(form, "n_results", "20"), 20, minimum=1, maximum=100),
-                            "save_playlist_name": get_value(form, "save_playlist_name"),
-                        }
-                        sections["discovery"] = {"state": state}
-                        if op == "search":
-                            if not state["song_query"].strip():
-                                raise ValueError("Enter a song search before trying to find seed tracks.")
-                            sections["discovery"]["search_results"] = search_seed_tracks(sp, state["song_query"])
-                        else:
-                            selected_track_id = get_value(form, "selected_track_id")
-                            sections["discovery"]["result"] = run_discovery_web(
-                                sp,
-                                mode=state["mode"],
-                                seed_track_id=selected_track_id,
-                                playlist_id=state["playlist_id"],
-                                n_results=state["n_results"],
-                                save_playlist_name=state["save_playlist_name"],
-                                playlists=playlists,
-                            )
-                            if sections["discovery"]["result"].get("saved_to"):
-                                flash = {
-                                    "kind": "success",
-                                    "message": f"Recommendations saved to '{sections['discovery']['result']['saved_to']}'.",
-                                }
-                except spotipy.SpotifyException as exc:
-                    flash = {"kind": "error", "message": describe_spotify_exception(exc)}
-                except Exception as exc:
-                    flash = {"kind": "error", "message": str(exc)}
+            if requested_job:
+                active_section = requested_job.section_anchor
+                sections = build_job_sections_snapshot(requested_job)
+                if requested_job.status == "completed":
+                    sections = requested_job.sections or sections
+                    flash = requested_job.flash
+                elif requested_job.status == "failed":
+                    flash = {"kind": "error", "message": describe_job_exception(requested_job.error)}
 
-            html = render_dashboard(overview, playlists, sections, flash, active_section)
+            if get_value(query, "busy") == "1" and active_job:
+                flash = {
+                    "kind": "error",
+                    "message": f"'{active_job.title}' is already running. Let it finish before starting another Spotify-heavy action.",
+                }
+                active_section = active_section or active_job.section_anchor
+
+            if method == "POST" and path == "/discovery":
+                form = form or {}
+                op = get_value(form, "op", "search")
+                if op == "search":
+                    active_section = "discovery"
+                    state = {
+                        "mode": get_value(form, "mode", "song"),
+                        "song_query": get_value(form, "song_query"),
+                        "playlist_id": get_value(form, "playlist_id"),
+                        "n_results": to_int(get_value(form, "n_results", "20"), 20, minimum=1, maximum=100),
+                        "save_playlist_name": get_value(form, "save_playlist_name"),
+                    }
+                    sections["discovery"] = {"state": state}
+                    try:
+                        if not state["song_query"].strip():
+                            raise ValueError("Enter a song search before trying to find seed tracks.")
+                        sections["discovery"]["search_results"] = search_seed_tracks(sp, state["song_query"])
+                    except spotipy.SpotifyException as exc:
+                        flash = {"kind": "error", "message": describe_spotify_exception(exc)}
+                    except Exception as exc:
+                        flash = {"kind": "error", "message": str(exc)}
+
+            html = render_dashboard(
+                overview,
+                playlists,
+                sections,
+                flash,
+                active_section,
+                active_job=active_job,
+                requested_job=requested_job,
+                rate_limit_status=getattr(sp, "get_rate_limit_status", lambda: {"cooldown_active": False})(),
+                job_poll_url=build_job_location(active_job.id, active_job.section_anchor) if active_job else "",
+            )
+            status = "200 OK"
         except SystemExit as exc:  # pragma: no cover - auth helper exits on missing credentials
             status = "500 Internal Server Error"
             html = render_error_page(RuntimeError(f"Spotify credentials are missing or invalid (exit code {exc.code})."))
@@ -782,6 +905,10 @@ def build_app():
     return app
 
 
+def parse_query(environ) -> dict[str, list[str]]:
+    return parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
+
+
 def parse_form(environ) -> dict[str, list[str]]:
     try:
         length = int(environ.get("CONTENT_LENGTH", "0") or "0")
@@ -789,6 +916,247 @@ def parse_form(environ) -> dict[str, list[str]]:
         length = 0
     raw = environ["wsgi.input"].read(length).decode("utf-8")
     return parse_qs(raw, keep_blank_values=True)
+
+
+def redirect(start_response, location: str):
+    start_response(
+        "303 See Other",
+        [
+            ("Location", location),
+            ("Cache-Control", "no-store"),
+        ],
+    )
+    return [b""]
+
+
+def build_job_location(job_id: str, section_anchor: str, *, busy: bool = False) -> str:
+    params = {"job_id": job_id}
+    if busy:
+        params["busy"] = "1"
+    return f"/?{urlencode(params)}#{section_anchor}"
+
+
+def invalidate_dashboard_cache():
+    _dashboard_cache["overview"] = None
+    _dashboard_cache["playlists"] = None
+    _dashboard_cache["expires_at"] = 0.0
+
+
+def should_enqueue_job(path: str, form: dict[str, list[str]]) -> bool:
+    if path == "/discovery" and get_value(form, "op", "search") == "search":
+        return False
+    return path in {"/duplicates", "/never-played", "/size-audit", "/organize-liked", "/discovery"}
+
+
+def build_job_sections_snapshot(job: BackgroundJob) -> dict[str, Any]:
+    if job.sections:
+        return job.sections
+    if not job.form_state:
+        return {}
+    return {job.section_key: dict(job.form_state)}
+
+
+def describe_job_exception(exc: Exception | None) -> str:
+    if exc is None:
+        return "The background job failed."
+    if isinstance(exc, spotipy.SpotifyException):
+        return describe_spotify_exception(exc)
+    return str(exc)
+
+
+def enqueue_background_job(path: str, form: dict[str, list[str]]):
+    if path == "/duplicates":
+        playlist_id = get_value(form, "playlist_id")
+        op = get_value(form, "op", "scan")
+        form_state = {"playlist_id": playlist_id}
+        title = "Removing duplicate songs..." if op == "remove" else "Scanning for duplicate songs..."
+        detail = (
+            "Spotify is removing or unliking the duplicate matches from the selected source."
+            if op == "remove"
+            else "Comparing songs by ISRC when possible, then title, artist, and duration."
+        )
+
+        def runner():
+            sp = get_spotify()
+            _, playlists = load_dashboard_context(sp)
+            flash = None
+            if op == "remove":
+                removal = remove_duplicates(sp, playlist_id, playlists)
+                flash = {"kind": "success", "message": removal["message"]}
+                invalidate_dashboard_cache()
+            return {
+                "sections": {
+                    "duplicates": {
+                        "playlist_id": playlist_id,
+                        "results": scan_duplicates(sp, playlist_id, playlists),
+                    }
+                },
+                "flash": flash,
+            }
+
+        job = BackgroundJob(
+            id=uuid4().hex,
+            section_key="duplicates",
+            section_anchor="duplicates",
+            title=title,
+            detail=detail,
+            form_state=form_state,
+        )
+        return _job_manager.enqueue(job, runner)
+
+    if path == "/never-played":
+        playlist_id = get_value(form, "playlist_id")
+        cutoff_days = to_int(get_value(form, "cutoff_days", "30"), 30, minimum=1, maximum=3650)
+
+        def runner():
+            sp = get_spotify()
+            _, playlists = load_dashboard_context(sp)
+            return {
+                "sections": {
+                    "never_played": {
+                        "playlist_id": playlist_id,
+                        "cutoff_days": cutoff_days,
+                        "report": scan_never_played(sp, playlist_id, cutoff_days, playlists),
+                    }
+                }
+            }
+
+        job = BackgroundJob(
+            id=uuid4().hex,
+            section_key="never_played",
+            section_anchor="never-played",
+            title="Building your never-played review...",
+            detail="Checking the selected playlist against recent listens and added dates.",
+            form_state={"playlist_id": playlist_id, "cutoff_days": cutoff_days},
+        )
+        return _job_manager.enqueue(job, runner)
+
+    if path == "/size-audit":
+        playlist_id = get_value(form, "playlist_id")
+        threshold = to_int(get_value(form, "threshold", "80"), 80, minimum=1, maximum=10000)
+        op = get_value(form, "op", "scan")
+
+        def runner():
+            sp = get_spotify()
+            _, playlists = load_dashboard_context(sp)
+            payload = {
+                "playlist_id": playlist_id,
+                "threshold": threshold,
+                "report": audit_playlist_sizes(sp, playlist_id, threshold, playlists),
+            }
+            if op == "preview":
+                payload["preview"] = build_smart_split_preview(sp, playlist_id, playlists)
+            return {"sections": {"size_audit": payload}}
+
+        job = BackgroundJob(
+            id=uuid4().hex,
+            section_key="size_audit",
+            section_anchor="size-audit",
+            title="Preparing playlist size insights..." if op == "scan" else "Preparing a smart split preview...",
+            detail=(
+                "Checking the playlist against your size threshold."
+                if op == "scan"
+                else "Fetching audio features and sketching a rough split layout."
+            ),
+            form_state={"playlist_id": playlist_id, "threshold": threshold},
+        )
+        return _job_manager.enqueue(job, runner)
+
+    if path == "/organize-liked":
+        strategy = get_value(form, "strategy", "both")
+        prefix = get_value(form, "prefix", "Liked Songs")
+        mood_clusters = to_int(get_value(form, "mood_clusters", "4"), 4, minimum=2, maximum=8)
+        create_playlists = get_value(form, "create_playlists") == "yes"
+
+        def runner():
+            sp = get_spotify()
+            result = organize_liked_web(
+                sp,
+                strategy=strategy,
+                prefix=prefix,
+                n_clusters=mood_clusters,
+                create_playlists=create_playlists,
+            )
+            flash = None
+            if create_playlists:
+                flash = {
+                    "kind": "success",
+                    "message": "Playlist organization finished. New playlists were created where groups had tracks.",
+                }
+                invalidate_dashboard_cache()
+            return {
+                "sections": {
+                    "organize": {
+                        "strategy": strategy,
+                        "prefix": prefix,
+                        "mood_clusters": mood_clusters,
+                        "create_playlists": create_playlists,
+                        "result": result,
+                    }
+                },
+                "flash": flash,
+            }
+
+        job = BackgroundJob(
+            id=uuid4().hex,
+            section_key="organize",
+            section_anchor="organize-liked",
+            title="Organizing liked songs...",
+            detail="Grouping liked songs by mood, genre, or both with cached Spotify metadata.",
+            form_state={
+                "strategy": strategy,
+                "prefix": prefix,
+                "mood_clusters": mood_clusters,
+                "create_playlists": create_playlists,
+            },
+        )
+        return _job_manager.enqueue(job, runner)
+
+    if path == "/discovery":
+        state = {
+            "mode": get_value(form, "mode", "song"),
+            "song_query": get_value(form, "song_query"),
+            "playlist_id": get_value(form, "playlist_id"),
+            "n_results": to_int(get_value(form, "n_results", "20"), 20, minimum=1, maximum=100),
+            "save_playlist_name": get_value(form, "save_playlist_name"),
+        }
+        selected_track_id = get_value(form, "selected_track_id")
+
+        def runner():
+            sp = get_spotify()
+            _, playlists = load_dashboard_context(sp)
+            result = run_discovery_web(
+                sp,
+                mode=state["mode"],
+                seed_track_id=selected_track_id,
+                playlist_id=state["playlist_id"],
+                n_results=state["n_results"],
+                save_playlist_name=state["save_playlist_name"],
+                playlists=playlists,
+            )
+            flash = None
+            if result.get("saved_to"):
+                flash = {
+                    "kind": "success",
+                    "message": f"Recommendations saved to '{result['saved_to']}'.",
+                }
+                invalidate_dashboard_cache()
+            return {
+                "sections": {"discovery": {"state": state, "result": result}},
+                "flash": flash,
+            }
+
+        job = BackgroundJob(
+            id=uuid4().hex,
+            section_key="discovery",
+            section_anchor="discovery",
+            title="Running music discovery...",
+            detail="Fetching recommendations and scoring how closely they match your target sound.",
+            form_state={"state": state},
+        )
+        return _job_manager.enqueue(job, runner)
+
+    raise ValueError(f"Unsupported background job path: {path}")
 
 
 def get_value(form: dict[str, list[str]], key: str, default: str = "") -> str:
@@ -1378,13 +1746,25 @@ def render_dashboard(
     sections: dict[str, Any],
     flash: dict[str, str] | None,
     active_section: str | None,
+    *,
+    active_job: BackgroundJob | None,
+    requested_job: BackgroundJob | None,
+    rate_limit_status: dict[str, Any],
+    job_poll_url: str,
 ) -> str:
     taste_status = "Ready" if overview["taste_model_ready"] else "Not built"
     flash_html = render_flash(flash)
+    job_html = render_job_banner(active_job, requested_job, rate_limit_status)
     section_jump = (
         f"<script>window.location.hash = '#{escape(active_section)}';</script>"
         if active_section else ""
     )
+    body_attrs = []
+    if active_job:
+        body_attrs.append('data-job-active="true"')
+        body_attrs.append(f'data-job-poll-url="{escape(job_poll_url, quote=True)}"')
+        body_attrs.append(f'data-job-poll-ms="{JOB_POLL_INTERVAL_MS}"')
+    body_attr_string = " ".join(body_attrs)
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -1393,7 +1773,7 @@ def render_dashboard(
   <title>spotify_manager web</title>
   <style>{APP_STYLES}</style>
 </head>
-<body>
+<body {body_attr_string}>
   <main class="shell">
     <section class="hero">
       <div class="eyebrow">spotify_manager web</div>
@@ -1426,6 +1806,7 @@ def render_dashboard(
       </div>
     </section>
     {flash_html}
+    {job_html}
     <section class="grid">
       {render_duplicates_section(playlists, sections.get("duplicates"))}
       {render_never_played_section(playlists, sections.get("never_played"))}
@@ -1472,6 +1853,47 @@ def render_flash(flash: dict[str, str] | None) -> str:
         return ""
     kind = "success" if flash.get("kind") == "success" else "error"
     return f'<div class="flash {kind}">{escape(flash.get("message", ""))}</div>'
+
+
+def render_job_banner(
+    active_job: BackgroundJob | None,
+    requested_job: BackgroundJob | None,
+    rate_limit_status: dict[str, Any],
+) -> str:
+    if active_job:
+        elapsed_from = active_job.started_at or active_job.created_at
+        elapsed = max(0, int(time.time() - elapsed_from))
+        status_label = "Queued" if active_job.status == "queued" else "Running"
+        meta = [
+            f"<span><strong>Status:</strong> {status_label}</span>",
+            f"<span><strong>Elapsed:</strong> {elapsed}s</span>",
+        ]
+        return f"""
+        <section class="job-banner running">
+          <strong>{escape(active_job.title)}</strong>
+          <div>{escape(active_job.detail)}</div>
+          <div class="job-meta">{''.join(meta)}</div>
+          <div class="job-help">The web UI is temporarily locked to one Spotify-heavy job so we do not pile up rate-limited requests. This page refreshes automatically every few seconds.</div>
+        </section>
+        """
+
+    if requested_job and requested_job.status == "failed":
+        return f"""
+        <section class="job-banner failed">
+          <strong>Last background job failed</strong>
+          <div>{escape(describe_job_exception(requested_job.error))}</div>
+        </section>
+        """
+
+    if rate_limit_status.get("cooldown_active"):
+        return f"""
+        <section class="job-banner failed">
+          <strong>Spotify cooldown active</strong>
+          <div>Spotify asked us to slow down. The client will keep reusing cached data and wait about {escape(format_wait_time(rate_limit_status.get('retry_after_seconds')))} before attempting fresh API reads again.</div>
+        </section>
+        """
+
+    return ""
 
 
 def render_loading_attrs(message: str, detail: str) -> str:
